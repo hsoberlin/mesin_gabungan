@@ -1221,6 +1221,13 @@ st.markdown(f"""
   padding:10px 14px; color:{COL['text']}; font-size:13px; margin:6px 0 10px 0; }}
 .mg-err {{ border:1px solid #2a1016; border-left:3px solid {COL['red']}; background:#12070a;
   padding:10px 14px; color:{COL['text']}; font-size:13px; margin:6px 0 10px 0; }}
+.mg-act {{ background:{COL['panel']}; border:1px solid #1a2430; padding:10px 14px; margin:0 0 8px 0;
+  font-size:15px; line-height:1.55; color:{COL['text']}; }}
+.mg-act .t {{ display:flex; justify-content:space-between; align-items:center; }}
+.mg-act .t .k {{ font-weight:800; color:#ffffff; font-size:19px; }}
+.mg-act .t .b {{ font-size:12px; font-weight:800; border:1px solid; padding:2px 8px; letter-spacing:1px; }}
+.mg-act .a {{ color:{COL['dim']}; font-size:12px; letter-spacing:1px; }}
+.mg-act .n {{ color:{COL['dim']}; font-size:13px; margin-top:2px; }}
 .mg-move {{ border:1px solid #10202a; border-left:4px solid {COL['cyan']}; background:#06121a;
   padding:12px 16px; color:{COL['text']}; font-size:15px; margin:6px 0 12px 0; }}
 @media (max-width: 640px) {{
@@ -1679,11 +1686,44 @@ with tab_aksi:
     if aksi_df.empty:
         st.info("Tidak ada aksi hari ini.")
     else:
-        st.dataframe(aksi_df.drop(columns="urut"), hide_index=True, width="stretch",
-                     height=min(640, 38 + 35 * len(aksi_df)),
-                     column_config={"lot": st.column_config.NumberColumn(format="%d"),
-                                    "harga": st.column_config.NumberColumn(format="%.0f"),
-                                    "nilai": st.column_config.NumberColumn(format="%.0f")})
+        AKSI_COL = {"JUAL": COL["red"], "CEK STOP": COL["red"], "CEK TP1": COL["green"],
+                    "CEK TERISI": COL["cyan"], "CABUT ANTRIAN": COL["amber"], "UBAH TP": COL["amber"],
+                    "UBAH SL": COL["amber"], "PASANG TP": COL["amber"], "PASANG SL": COL["amber"],
+                    "PINDAH KAS": COL["cyan"], "BELI": COL["green"], "ANTRI BELI": COL["violet"],
+                    "LENGKAPI": COL["dim"], "CEK DATA": COL["dim"], "LEWATI": COL["dim"],
+                    "TERLEWAT (KAS)": COL["dim"]}
+        html = ""
+        for _, a in aksi_df.iterrows():
+            c = AKSI_COL.get(a["aksi"], COL["text"])
+            baris = []
+            if pd.notna(a["lot"]) and pd.notna(a["harga"]):
+                baris.append(f"<b>{rp(a['lot'])} lot</b> @ <b>{rp(a['harga'])}</b>")
+            elif pd.notna(a["lot"]):
+                baris.append(f"<b>{rp(a['lot'])} lot</b>")
+            elif pd.notna(a["harga"]):
+                baris.append(f"harga <b>{rp(a['harga'])}</b>")
+            if pd.notna(a["nilai"]):
+                baris.append(f"Rp {rp(a['nilai'])}")
+            tpsl = []
+            if a["tp"]:
+                tpsl.append(f'TP <b style="color:{COL["green"]}">{a["tp"]}</b>')
+            if a["sl"]:
+                tpsl.append(f'SL <b style="color:{COL["red"]}">{a["sl"]}</b>')
+            html += (f'<div class="mg-act" style="border-left:4px solid {c}">'
+                     f'<div class="t"><span class="k">{a["kode"]}</span>'
+                     f'<span class="b" style="color:{c};border-color:{c}">{a["aksi"]}</span></div>'
+                     f'<div class="a">{a["akun"]}</div>'
+                     + (f'<div class="r">{" · ".join(baris)}</div>' if baris else "")
+                     + (f'<div class="r">{" · ".join(tpsl)}</div>' if tpsl else "")
+                     + f'<div class="n">{a["alasan"]}</div></div>')
+        st.markdown(html, unsafe_allow_html=True)
+        with st.expander("Lihat sebagai tabel"):
+            tampil = aksi_df.drop(columns="urut").copy()
+            for kol in ("lot", "harga", "nilai"):
+                tampil[kol] = [rp(x) if pd.notna(x) else "" for x in tampil[kol]]
+            st.dataframe(tampil, hide_index=True, width="stretch",
+                         column_config={"nilai": st.column_config.TextColumn(width="medium"),
+                                        "alasan": st.column_config.TextColumn(width="large")})
     st.caption("Urutan: jual/cek dulu → ubah order & antrian → pindah kas → beli Compounding → antri harmonic. "
                "Harga antri sudah sesuai fraksi BEI. Harmonic: jual semua di TP1, stop basis close harian.")
 
