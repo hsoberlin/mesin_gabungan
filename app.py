@@ -33,6 +33,10 @@ try:
     import yfinance as yf
 except ImportError:
     yf = None
+try:
+    import plotly.graph_objects as go
+except ImportError:
+    go = None
 
 WIB = timezone(timedelta(hours=7))
 
@@ -986,6 +990,143 @@ def ct_table(rows, mm):
     return df, ambang_lama, ambang_baru
 
 
+
+# =============================================================================
+# 7b. GRAFIK POLA (disalin dari harmonic_board_app.py)
+# =============================================================================
+CHART_COL = dict(bg="#06080b", panel="#0b1016", grid="#141c25", text="#c9d4df",
+                 green="#00ff9c", red="#ff4d6d", amber="#ffb000", cyan="#22d3ee",
+                 violet="#a78bfa", dim="#4b5a6a")
+CHART_FONT = "JetBrains Mono, Consolas, monospace"
+
+
+def _base_layout(fig, df, start, x_end, title, title_color, nticks=7):
+    xs = np.arange(start, len(df))
+    step = max(1, len(xs) // nticks)
+    tv = list(xs[step // 2::step])
+    tt, prev_y = [], None
+    for i in tv:
+        d = df.index[i]
+        lab = d.strftime("%d %b")
+        if d.year != prev_y:
+            lab += d.strftime(" '%y")
+            prev_y = d.year
+        tt.append(lab)
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor=CHART_COL["bg"], plot_bgcolor=CHART_COL["panel"],
+        font=dict(family=CHART_FONT, color=CHART_COL["text"], size=12),
+        height=620, margin=dict(l=8, r=8, t=44, b=8),
+        title=dict(text=title, font=dict(color=title_color, size=15), x=0.01),
+        xaxis=dict(rangeslider=dict(visible=False), tickvals=tv, ticktext=tt,
+                   gridcolor=CHART_COL["grid"], range=[start - 2, x_end]),
+        yaxis=dict(gridcolor=CHART_COL["grid"], side="right", tickformat=",.0f"),
+        showlegend=False, hovermode="x unified", dragmode="pan",
+    )
+
+
+def _candles(fig, df, start):
+    d = df.iloc[start:]
+    xs = np.arange(start, len(df))
+    fig.add_trace(go.Candlestick(
+        x=xs, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"],
+        increasing=dict(line=dict(color=CHART_COL["green"], width=1), fillcolor=CHART_COL["green"]),
+        decreasing=dict(line=dict(color=CHART_COL["red"], width=1), fillcolor=CHART_COL["red"]),
+        hovertext=list(d.index.strftime("%d %b %Y")), hoverinfo="text+y", name="Harga",
+    ))
+
+
+def _zigzag(fig, pivots, tent, start):
+    zz = [q for q in pivots if q[0] >= start]
+    if tent and tent[0] >= start:
+        zz = zz + [tent]
+    if zz:
+        fig.add_trace(go.Scatter(x=[q[0] for q in zz], y=[q[1] for q in zz], mode="lines",
+                                 line=dict(color=CHART_COL["dim"], width=1, dash="dot"), hoverinfo="skip"))
+
+
+def make_chart(code, df, p, scale_txt="", compact=True):
+    n = len(df)
+    proj = 20 if compact else 30
+    start = max(0, (p["B"][0] - 10) if compact else (p["X"][0] - 30))
+    x1 = n - 1 + proj
+    bull = p["arah"] == "Bullish"
+    accent = CHART_COL["cyan"] if bull else CHART_COL["amber"]
+    fill = "rgba(34,211,238,0.13)" if bull else "rgba(255,176,0,0.13)"
+    fig = go.Figure()
+    _candles(fig, df, start)
+    _zigzag(fig, p["pivots"], p["tent"], start)
+    X, A, B, C = p["X"], p["A"], p["B"], p["C"]
+    if p["D"] is not None:
+        D, d_dash = (p["D"][0], p["D"][1]), "solid"
+    elif p.get("touch_idx") is not None:
+        D, d_dash = (p["touch_idx"], p["entry"]), "solid"
+    else:
+        D, d_dash = (n - 1 + proj // 3, p["entry"]), "dash"
+    for pts in ([X, A, B], [B, C, D]):
+        fig.add_trace(go.Scatter(x=[q[0] for q in pts] + [pts[0][0]], y=[q[1] for q in pts] + [pts[0][1]],
+                                 fill="toself", fillcolor=fill, line=dict(width=0), hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=[X[0], A[0], B[0], C[0]], y=[X[1], A[1], B[1], C[1]], mode="lines+markers",
+                             line=dict(color=accent, width=2), marker=dict(size=7, color=accent), hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=[C[0], D[0]], y=[C[1], D[1]], mode="lines",
+                             line=dict(color=accent, width=2, dash=d_dash), hoverinfo="skip"))
+    for lab, q in zip("XABCD", [X, A, B, C, D]):
+        if q[0] < start:
+            continue
+        is_low = (lab in "XBD") if bull else (lab in "AC")
+        fig.add_annotation(x=q[0], y=q[1], text=f"<b>{lab}</b>", showarrow=False,
+                           yshift=-16 if is_low else 16, font=dict(color=CHART_COL["text"], size=14))
+    zone_fill = ["rgba(167,139,250,0.30)", "rgba(167,139,250,0.15)"]
+    printed = []
+    for k, z in enumerate(p["zones"]):
+        x0 = C[0] + (D[0] - C[0]) // 2
+        mid = (z["lo"] + z["hi"]) / 2
+        half = max((z["hi"] - z["lo"]) / 2, abs(mid) * 0.006)
+        y0v, y1v = mid - half, mid + half
+        fig.add_shape(type="rect", x0=x0, x1=x1, y0=y0v, y1=y1v,
+                      fillcolor=zone_fill[min(k, 1)], line=dict(color=CHART_COL["violet"], width=1))
+        if k == 0:
+            fig.add_annotation(x=x0, y=y1v, xanchor="left", yanchor="bottom", showarrow=False,
+                               text=f"PRZ {z['r']}", font=dict(color=CHART_COL["violet"], size=11),
+                               bgcolor="rgba(6,8,11,0.75)")
+        for v_, yv, anc in ((z["hi"], y1v, "bottom"), (z["lo"], y0v, "top")):
+            if any(abs(v_ - w) / max(abs(w), 1e-9) < 0.005 for w in printed):
+                continue
+            printed.append(v_)
+            fig.add_annotation(x=x1, y=yv, xanchor="right", yanchor=anc, showarrow=False,
+                               text=f"({v_:,.0f})", font=dict(color=CHART_COL["violet"], size=11))
+    lines = [(p["sl"], "STOP POLA", CHART_COL["red"]), (p["tp1"], "TP1", CHART_COL["green"]),
+             (p["tp2"], "TP2", CHART_COL["green"])]
+    if p["status"] == "Menuju PRZ":
+        lines.append((C[1], "INVALID", CHART_COL["amber"]))
+    for lvl, lab, colr in lines:
+        fig.add_shape(type="line", x0=C[0], x1=x1, y0=lvl, y1=lvl, line=dict(color=colr, width=1, dash="dash"))
+        fig.add_annotation(x=x1, y=lvl, xanchor="right", yanchor="bottom", showarrow=False,
+                           text=f"{lab} ({lvl:,.0f})", font=dict(color=colr, size=11), bgcolor="rgba(6,8,11,0.7)")
+    last_px = float(df["Close"].iloc[-1])
+    fig.add_shape(type="line", x0=start, x1=x1, y0=last_px, y1=last_px,
+                  line=dict(color="#ffffff", width=1.2, dash="dot"))
+    fig.add_annotation(x=start, y=last_px, xanchor="left", yanchor="bottom", showarrow=False,
+                       text=f"<b>HARGA {last_px:,.0f}</b>", font=dict(color="#000", size=11), bgcolor="#ffffff")
+    tx = min(x1 - 2, D[0] + proj // 2)
+    fig.add_annotation(x=tx, y=p["tp2"], ax=D[0], ay=D[1], xref="x", yref="y", axref="x", ayref="y",
+                       showarrow=True, arrowhead=3, arrowsize=1.2, arrowwidth=1.5,
+                       arrowcolor=CHART_COL["green"], text="")
+    title = f"{code} · {p['pattern']} · {p['status']}" + (f" · {scale_txt}" if scale_txt else "")
+    _base_layout(fig, df, start, x1 + 2, title, accent, nticks=4 if compact else 7)
+    if compact:
+        fig.update_layout(height=460, title=dict(font=dict(size=12)), margin=dict(l=4, r=4, t=36, b=4))
+    return fig
+
+
+def find_pattern(d, skala, pola, tgl_c):
+    mult, age = HB_SCALES[skala]
+    for p in detect_patterns(d, 14, mult, age, None, "Close harian", 0.0):
+        if (p["arah"] == "Bullish" and p["pattern"] == pola
+                and d.index[p["C"][0]].strftime("%d %b %y") == tgl_c):
+            return p
+    return None
+
+
 # =============================================================================
 # 8. STATE, CEK POSISI & ALOKASI
 # =============================================================================
@@ -1228,6 +1369,11 @@ st.markdown(f"""
 .mg-act .t .b {{ font-size:12px; font-weight:800; border:1px solid; padding:2px 8px; letter-spacing:1px; }}
 .mg-act .a {{ color:{COL['dim']}; font-size:12px; letter-spacing:1px; }}
 .mg-act .n {{ color:{COL['dim']}; font-size:13px; margin-top:2px; }}
+.mg-strip {{ display:flex; flex-wrap:wrap; gap:6px 14px; font-size:12px; color:{COL['dim']};
+  border:1px solid #1a2430; background:{COL['panel']}; padding:8px 12px; margin-bottom:10px; }}
+.mg-strip b {{ color:{COL['text']}; }}
+.mg-bar {{ background:#22252B; height:4px; margin-top:4px; }}
+.mg-bar div {{ height:100%; }}
 .mg-move {{ border:1px solid #10202a; border-left:4px solid {COL['cyan']}; background:#06121a;
   padding:12px 16px; color:{COL['text']}; font-size:15px; margin:6px 0 12px 0; }}
 @media (max-width: 640px) {{
@@ -1327,13 +1473,14 @@ if ihsg_raw is None or len(ihsg_raw) < 260:
 ihsg, ihsg_telat = ihsg_fixed(ihsg_raw, stock_last)
 mm = market_mode(ihsg)
 
-st.markdown(cards([
-    ("SESI", sesi, COL["cyan"] if sesi.startswith("SESI") else COL["amber"], sesi_txt),
-    ("DATA SAHAM", stock_last.strftime("%d %b %Y"), COL["text"], f"{len(data_all)} emiten termuat"),
-    ("DATA IHSG", mm["tanggal"].strftime("%d %b %Y"), COL["red"] if ihsg_telat else COL["text"],
-     "TERTINGGAL dari data saham" if ihsg_telat else "sinkron dengan data saham"),
-    ("DIBUKA", now.strftime("%d %b %H:%M"), COL["dim"], "WIB"),
-]), unsafe_allow_html=True)
+_sc = COL["cyan"] if sesi.startswith("SESI") else COL["amber"]
+_ic = COL["red"] if ihsg_telat else COL["text"]
+st.markdown(f'<div class="mg-strip"><span><b style="color:{_sc}">{sesi}</b></span>'
+            f'<span>saham <b>{stock_last.strftime("%d %b")}</b></span>'
+            f'<span>IHSG <b style="color:{_ic}">{mm["tanggal"].strftime("%d %b")}</b></span>'
+            f'<span>dibuka <b>{now.strftime("%d %b %H:%M")}</b></span>'
+            f'<span>{len(data_all)} emiten</span></div>', unsafe_allow_html=True)
+st.caption(sesi_txt)
 if ihsg_telat:
     st.markdown(f'<div class="mg-err"><b>Mode pasar memakai IHSG tanggal {mm["tanggal"].strftime("%d %b %Y")}</b>, '
                 f'sedangkan data saham sudah {stock_last.strftime("%d %b %Y")}. Yahoo belum memperbarui ^JKSE. '
@@ -1341,7 +1488,7 @@ if ihsg_telat:
                 unsafe_allow_html=True)
 
 tab_ring, tab_aksi, tab_state, tab_hb, tab_ct = st.tabs(
-    ["▌RINGKASAN", "▌AKSI HARI INI", "▌STATE & JURNAL", "▌HARMONIC", "▌COMPOUNDING"])
+    ["RINGKAS", "AKSI", "STATE", "HARMONIC", "COMPOUND"])
 
 # ----------------------------------------------------------------- STATE (dibaca lebih dulu)
 with tab_state:
@@ -1405,9 +1552,11 @@ with tab_state:
     ss["meta"] = {"kas_OBERLIN": kas_ob, "kas_TEKNIKAL": kas_tk, "kas_settle": kas_settle,
                   "modal_masuk": modal_masuk}
 
-    st.markdown("**3. Posisi** (tambah/hapus baris langsung di tabel)")
+    st.markdown("**3. Posisi** (tambah/hapus baris langsung di tabel; kolom teknis ada di ujung kanan)")
     pos_df = st.data_editor(
         ss["pos_base"], key=f"ed_pos_{v}", num_rows="dynamic", hide_index=True, width="stretch",
+        column_order=["akun", "kode", "asal", "lot", "avg", "tp1", "stop", "order_tp", "order_sl",
+                      "tanggal_beli", "harga_c", "ll20", "ob_streak", "ob_tgl", "catatan"],
         column_config={
             "akun": st.column_config.SelectboxColumn(options=AKUN, required=True),
             "asal": st.column_config.SelectboxColumn(options=ASAL, required=True),
@@ -1768,7 +1917,60 @@ with tab_ring:
     if pos_df.empty and q_df.empty and kas_ob == 0 and kas_tk == 0:
         st.markdown('<div class="mg-warn">State masih kosong. Muat file state atau impor portfolio.json '
                     'di tab STATE & JURNAL, lalu isi kas kedua akun.</div>', unsafe_allow_html=True)
-    st.line_chart(ihsg.tail(250).rename("IHSG"), height=220)
+    st.markdown("**Posisi dipegang**")
+    if pos_df.empty:
+        st.caption("Belum ada posisi.")
+    else:
+        status_map = {}
+        for a in aksi:
+            if a["aksi"] in ("LEWATI", "TERLEWAT (KAS)", "PINDAH KAS", "PINDAH KAS T+2", "ANTRI BELI", "BELI"):
+                continue
+            status_map.setdefault(a["kode"], []).append(a["aksi"])
+        html = ""
+        for i, r in pos_df.iterrows():
+            lot, avg = num(r["lot"]), num(r["avg"])
+            px = last_close(r["kode"], avg)
+            pl = (px / avg - 1) * 100 if avg > 0 else 0.0
+            st_ = status_map.get(r["kode"], [])
+            if any(x in ("JUAL", "CEK STOP") for x in st_):
+                lab, c = "JUAL", COL["red"]
+            elif st_:
+                lab, c = st_[0], COL["amber"]
+            else:
+                lab, c = "HOLD", COL["green"]
+            if r["asal"] == "deviasi":
+                c2 = COL["dim"]
+            else:
+                c2 = c
+            info = []
+            if r["asal"] == "compounding":
+                e = pos_eval.get(i, {})
+                info.append(f'CL <b style="color:{COL["red"]}">{rp(num(r["ll20"]))}</b>')
+                info.append(f'K <b>{e.get("k") or 0:.0f}</b> · ob <b>{e.get("ob", 0)}/2</b>')
+            elif r["asal"] in ("harmonic_besar", "harmonic_menengah"):
+                tp1, stp = num(r["tp1"]), num(r["stop"])
+                if tp1 > 0:
+                    info.append(f'TP1 <b style="color:{COL["green"]}">{rp(tp1)}</b> ({(tp1 / px - 1) * 100:+.1f}%)')
+                if stp > 0:
+                    info.append(f'stop <b style="color:{COL["red"]}">{rp(stp)}</b> ({(stp / px - 1) * 100:+.1f}%)')
+            else:
+                od = parse_orders(r["order_tp"])
+                if od:
+                    info.append("TP " + ", ".join(f"{a_}@{rp(b_)}" for a_, b_ in od))
+                ods = parse_orders(r["order_sl"])
+                if ods:
+                    info.append("SL " + ", ".join(f"{a_}@{rp(b_)}" for a_, b_ in ods))
+            plc = COL["green"] if pl >= 0 else COL["red"]
+            html += (f'<div class="mg-act" style="border-left:4px solid {c2}">'
+                     f'<div class="t"><span class="k">{r["kode"]}</span>'
+                     f'<span class="b" style="color:{c};border-color:{c}">{lab}</span></div>'
+                     f'<div class="a">{r["akun"]} · {r["asal"]}</div>'
+                     f'<div class="r"><b>{rp(lot)} lot</b> · harga <b>{rp(px)}</b> · avg {f"{avg:,.2f}".replace(",", "#").replace(".", ",").replace("#", ".")} · '
+                     f'<b style="color:{plc}">{pl:+.1f}%</b></div>'
+                     + (f'<div class="r">{" · ".join(info)}</div>' if info else "") + "</div>")
+        st.markdown(html, unsafe_allow_html=True)
+    with st.expander("Grafik IHSG"):
+        st.line_chart(ihsg.tail(250).rename("IHSG"), height=220)
 
 # ----------------------------------------------------------------- AKSI
 with tab_aksi:
@@ -1909,9 +2111,50 @@ with tab_hb:
              f"PRZ disentuh > {HB_SENTUH_MAX} hari bursa lalu"),
             ("PRZ LEBAR", int((vv["PRZ lebar"] != "").sum()), COL["red"], f"risiko > {HB_LEBAR_X:g}× potensi"),
         ]), unsafe_allow_html=True)
+        vv["_o"] = [0 if (so == "SAH" and dp != "ya") else (1 if dp == "ya" else 2)
+                    for so, dp in zip(vv["Status Order"], vv["Dipegang/antri"])]
+        vv = vv.sort_values(["_o"], kind="stable").drop(columns="_o").reset_index(drop=True)
+        SO_COL = {"SAH": COL["cyan"], "TUA": COL["amber"], "KEDALUWARSA": COL["dim"]}
+        for j, r in vv.iterrows():
+            held = r["Dipegang/antri"] == "ya"
+            lab = "DIPEGANG" if held else r["Status Order"]
+            c = COL["green"] if held else SO_COL.get(r["Status Order"], COL["red"])
+            sentuh = ("belum disentuh" if pd.isna(r["Sentuh PRZ (hari lalu)"])
+                      else f'disentuh {int(r["Sentuh PRZ (hari lalu)"])} hari lalu')
+            mh = r["Min hari ke PRZ"]
+            mh_txt = "sudah di/bawah PRZ" if mh == 0 else (f"min {mh} hari ke PRZ" if mh is not None else "")
+            lebar = f' · <b style="color:{COL["red"]}">PRZ LEBAR</b>' if r["PRZ lebar"] else ""
+            st.markdown(
+                f'<div class="mg-act" style="border-left:4px solid {c}">'
+                f'<div class="t"><span class="k">{r["Kode"]}</span>'
+                f'<span class="b" style="color:{c};border-color:{c}">{lab}</span></div>'
+                f'<div class="a">{r["Skala"]} · {r["Pola"]} · {r["Status"]}</div>'
+                f'<div class="r">Harga <b>{rp(r["Harga"])}</b> · jarak PRZ <b>{r["Jarak PRZ %"]:.1f}%</b> · {mh_txt}</div>'
+                f'<div class="r">Antri <b style="color:{COL["violet"]}">{rp(r["Antri Atas"])}</b> / '
+                f'<b style="color:{COL["violet"]}">{rp(r["Antri Bawah"])}</b> · TP1 '
+                f'<b style="color:{COL["green"]}">{rp(r["TP1"])}</b> · stop '
+                f'<b style="color:{COL["red"]}">{rp(r["Stop (close)"])}</b></div>'
+                f'<div class="r">Dari antri atas: risiko <b style="color:{COL["red"]}">{r["Risiko dari atas %"]:.0f}%</b>'
+                f' · potensi <b style="color:{COL["green"]}">+{r["Potensi TP1 dari atas %"]:.0f}%</b>{lebar}</div>'
+                f'<div class="n">PRZ {sentuh} · aktif sejak {r["Aktif sejak"]} · {r["Waktu"]}</div></div>',
+                unsafe_allow_html=True)
+            ck = f'{r["Kode"]}|{r["Skala"]}|{r["Pola"]}|{r["Tanggal C"]}'
+            if go is not None and st.button(f"Grafik {r['Kode']} ›", key=f"g_{ck}", width="stretch"):
+                ss["_chart"] = None if ss.get("_chart") == ck else ck
+            if ss.get("_chart") == ck:
+                dd = hb_frame(data_all.get(r["Kode"]))
+                p = find_pattern(dd, r["Skala"], r["Pola"], r["Tanggal C"]) if dd is not None else None
+                if p is not None:
+                    st.plotly_chart(make_chart(r["Kode"], dd, p, r["Skala"]), width="stretch",
+                                    config={"displaylogo": False, "scrollZoom": True}, key=f"ch_{ck}")
+                else:
+                    st.caption("Pola tidak ditemukan ulang (data berubah). Tekan Tarik ulang data.")
+        if go is None:
+            st.caption("Grafik butuh paket plotly (tambahkan ke requirements.txt).")
         num0 = st.column_config.NumberColumn(format="%.0f")
         num1 = st.column_config.NumberColumn(format="%.1f")
-        st.dataframe(
+        with st.expander("Lihat sebagai tabel"):
+          st.dataframe(
             vv, hide_index=True, width="stretch", height=min(640, 38 + 35 * max(len(vv), 1)),
             column_order=["Kode", "Skala", "Pola", "Status Order", "Dipegang/antri", "Status", "Kategori",
                           "PRZ lebar", "Harga", "Jarak PRZ %", "Min hari ke PRZ", "Antri Atas", "Antri Bawah",
@@ -1944,7 +2187,22 @@ with tab_ct:
              "red-flag, ARA, ambang BEAR, euforia"),
             ("AMBANG CONF", f"{amb_baru}", COL["amber"], f"versi lama: {amb_lama}"),
         ]), unsafe_allow_html=True)
-        st.dataframe(ctdf, hide_index=True, width="stretch", height=min(640, 38 + 35 * max(len(ctdf), 1)),
+        for _, r in ctdf.iterrows():
+            beli = r["Status"] == "BELI"
+            c = COL["green"] if beli else COL["dim"]
+            conf = float(r["Buy Conf"])
+            cc = COL["green"] if conf >= 75 else (COL["amber"] if conf >= 50 else COL["red"])
+            st.markdown(
+                f'<div class="mg-act" style="border-left:4px solid {c}">'
+                f'<div class="t"><span class="k">{r["Kode"]}</span>'
+                f'<span class="b" style="color:{c};border-color:{c}">{"BELI" if beli else "DICORET"}</span></div>'
+                f'<div class="r">Conf <b style="color:{cc}">{conf:.0f}%</b> · close <b>{rp(r["Close"])}</b> '
+                f'({r["Naik hari ini %"]:+.1f}%) · CL <b style="color:{COL["red"]}">{rp(r["CL (LL20)"])}</b></div>'
+                f'<div class="mg-bar"><div style="width:{conf:.0f}%;background:{cc}"></div></div>'
+                f'<div class="n">K {r["K"]:.0f} · fase {r["Fase"]} · vol ratio {r["Vol Ratio"]:.2f}'
+                + ("" if beli else f' · {r["Status"]}') + '</div></div>', unsafe_allow_html=True)
+        with st.expander("Lihat sebagai tabel"):
+          st.dataframe(ctdf, hide_index=True, width="stretch", height=min(640, 38 + 35 * max(len(ctdf), 1)),
                      column_config={"Buy Conf": st.column_config.NumberColumn(format="%.0f"),
                                     "Close": st.column_config.NumberColumn(format="%.0f"),
                                     "CL (LL20)": st.column_config.NumberColumn(format="%.0f"),
