@@ -1267,9 +1267,30 @@ ss = st.session_state
 ss.setdefault("ver", 0)
 ss.setdefault("pos_base", to_frame([], POS_COLS, NUM_POS))
 ss.setdefault("q_base", to_frame([], Q_COLS, NUM_Q))
-ss.setdefault("meta", {"kas_OBERLIN": 0.0, "kas_TEKNIKAL": 0.0, "modal_masuk": 0.0})
+ss.setdefault("meta", {"kas_OBERLIN": 0.0, "kas_TEKNIKAL": 0.0, "kas_settle": 0.0, "modal_masuk": 0.0})
 ss.setdefault("_up_sig", None)
 ss.setdefault("_ct_sig", None)
+
+# State otomatis: kalau sesi baru dan ada file state_gabungan.json di repo, langsung dimuat.
+STATE_REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state_gabungan.json")
+if not ss.get("_auto_loaded"):
+    ss["_auto_loaded"] = True
+    ss["_auto_src"] = None
+    if os.path.exists(STATE_REPO):
+        try:
+            with open(STATE_REPO, encoding="utf-8") as f:
+                js0 = json.load(f)
+            ss["pos_base"] = to_frame(js0.get("posisi", []), POS_COLS, NUM_POS)
+            ss["q_base"] = to_frame(js0.get("antrian", []), Q_COLS, NUM_Q)
+            kas0 = js0.get("kas", {})
+            ss["meta"] = {"kas_OBERLIN": float(kas0.get("OBERLIN", 0) or 0),
+                          "kas_TEKNIKAL": float(kas0.get("TEKNIKAL", 0) or 0),
+                          "kas_settle": float(js0.get("kas_settle_teknikal", kas0.get("TEKNIKAL", 0)) or 0),
+                          "modal_masuk": float(js0.get("modal_masuk_teknikal", 0) or 0)}
+            ss["_auto_src"] = js0.get("disimpan", "?")
+            ss["ver"] += 1
+        except Exception:
+            ss["_auto_src"] = "GAGAL"
 
 with st.sidebar:
     st.markdown("### ▌PARAMETER")
@@ -1324,7 +1345,12 @@ tab_ring, tab_aksi, tab_state, tab_hb, tab_ct = st.tabs(
 
 # ----------------------------------------------------------------- STATE (dibaca lebih dulu)
 with tab_state:
-    st.markdown("**1. Muat state**")
+    src0 = ss.get("_auto_src")
+    if src0 and src0 != "GAGAL":
+        st.success(f"State otomatis dimuat dari state_gabungan.json di repo (disimpan {src0}).")
+    elif src0 == "GAGAL":
+        st.error("state_gabungan.json di repo ada, tapi isinya tidak terbaca.")
+    st.markdown("**1. Muat state** (opsional, untuk mengganti state otomatis dengan yang lebih baru)")
     c1, c2 = st.columns(2)
     up = c1.file_uploader("State dashboard (state_gabungan_*.json)", type="json", key="up_state")
     if up is not None and ss["_up_sig"] != (up.name, up.size):
@@ -1335,6 +1361,7 @@ with tab_state:
             kas = js.get("kas", {})
             ss["meta"] = {"kas_OBERLIN": float(kas.get("OBERLIN", 0) or 0),
                           "kas_TEKNIKAL": float(kas.get("TEKNIKAL", 0) or 0),
+                          "kas_settle": float(js.get("kas_settle_teknikal", kas.get("TEKNIKAL", 0)) or 0),
                           "modal_masuk": float(js.get("modal_masuk_teknikal", 0) or 0)}
             ss["_up_sig"] = (up.name, up.size)
             ss["ver"] += 1
@@ -1350,6 +1377,7 @@ with tab_state:
             base = base[base["akun"] != "TEKNIKAL"]
             ss["pos_base"] = to_frame(clean_records(base) + rows, POS_COLS, NUM_POS)
             ss["meta"]["kas_TEKNIKAL"] = kas_ct
+            ss["meta"]["kas_settle"] = kas_ct
             ss["meta"]["modal_masuk"] = modal_ct
             ss["_ct_sig"] = (upc.name, upc.size)
             ss["ver"] += 1
@@ -1361,15 +1389,21 @@ with tab_state:
 
     st.markdown("**2. Kas tersedia (samakan dengan Trading Balance Stockbit, sudah dikurangi antrian ACTIVE)**")
     v = ss["ver"]
-    k1, k2, k3 = st.columns(3)
+    k1, k2, k4, k3 = st.columns(4)
     kas_ob = k1.number_input("Kas OBERLIN (Rp)", 0.0, 1e12, float(ss["meta"]["kas_OBERLIN"]), 100_000.0,
                              format="%.0f", key=f"kas_ob_{v}")
     kas_tk = k2.number_input("Kas TEKNIKAL (Rp)", 0.0, 1e12, float(ss["meta"]["kas_TEKNIKAL"]), 100_000.0,
                              format="%.0f", key=f"kas_tk_{v}")
+    kas_settle = k4.number_input("Kas TEKNIKAL sudah settle (Rp)", 0.0, 1e12,
+                                 float(min(ss["meta"].get("kas_settle", kas_tk), kas_tk)), 100_000.0,
+                                 format="%.0f", key=f"kas_st_{v}",
+                                 help="Bagian kas yang boleh ditransfer ke sub-akun lain (hasil jual sudah lewat T+2).")
+    kas_settle = min(kas_settle, kas_tk)
     modal_masuk = k3.number_input("Total Modal Masuk TEKNIKAL (Rp)", 0.0, 1e12, float(ss["meta"]["modal_masuk"]),
                                   1_000_000.0, format="%.0f", key=f"mm_{v}",
                                   help="Dasar sizing Compounding 20% per posisi, sama dengan app lama.")
-    ss["meta"] = {"kas_OBERLIN": kas_ob, "kas_TEKNIKAL": kas_tk, "modal_masuk": modal_masuk}
+    ss["meta"] = {"kas_OBERLIN": kas_ob, "kas_TEKNIKAL": kas_tk, "kas_settle": kas_settle,
+                  "modal_masuk": modal_masuk}
 
     st.markdown("**3. Posisi** (tambah/hapus baris langsung di tabel)")
     pos_df = st.data_editor(
@@ -1585,7 +1619,8 @@ if not hb_df.empty:
             lewati_m.append(r["Kode"])
             continue
         item = dict(kode=r["Kode"], asal=asal, legs=legs, butuh=butuh, tp1=r["TP1"], stop=r["Stop (close)"],
-                    harga_c=r["Harga C"], pola=r["Pola"], skala=r["Skala"])
+                    harga_c=r["Harga C"], pola=r["Pola"], skala=r["Skala"],
+                    harga_now=r["Harga"], top=r["Antri Atas"])
         if butuh <= kas_ob_sisa:
             kas_ob_sisa -= butuh
             if asal == "harmonic_menengah":
@@ -1604,31 +1639,77 @@ if lewati_m:
     aksi.append(dict(urut=7, akun="OBERLIN", aksi="LEWATI", kode=", ".join(lewati_m), lot=None, harga=None,
                      nilai=None, tp="", sl="",
                      alasan=f"{len(lewati_m)} sinyal Menengah SAH: jatah penuh ({rp(eksp_m)} dari batas {rp(cap_m)})"))
+# ---- penutupan kekurangan kas OBERLIN saat PANIK, urut prioritas sinyal Besar ----
+#  a) kas TEKNIKAL yang sudah settle -> transfer sekarang
+#  b) kas TEKNIKAL yang belum settle -> transfer setelah T+2, hanya kalau harga butuh >= 3 hari (ARB) ke PRZ
+#  c) saham TEKNIKAL yang hari ini memang disuruh JUAL -> pindah saham ke OBERLIN, jual di OBERLIN
 idle_tk = max(kas_tk_sisa, 0.0)
+pool_now = min(kas_settle, idle_tk)
+pool_later = idle_tk - pool_now
+jual_tk = [a for a in aksi if a["akun"] == "TEKNIKAL" and a["aksi"] == "JUAL" and pd.notna(a["harga"])]
+pindah_now = pindah_later = 0.0
+pindah_saham = []
 saran_pindah = 0.0
-pool = idle_tk
 for item in butuh_pindah:
-    # sinyal Besar diproses sesuai prioritas; hanya yang kekurangannya tertutup penuh yang dibuatkan order
-    if item["kurang"] <= pool + 1:
-        pool -= item["kurang"]
-        saran_pindah += item["kurang"]
-        kurang_besar += item["kurang"]
-        hb_orders.append(dict(item, setelah_pindah=True))
+    k = item["kurang"]
+    kurang_besar += k
+    hari = min_hari_ke_prz(item["harga_now"], item["top"], arb)
+    item["min_hari"] = hari
+    a_now = min(k, pool_now)
+    sisa = k - a_now
+    a_later = 0.0
+    if sisa > 1 and hari is not None and hari >= 3:
+        a_later = min(sisa, pool_later)
+        sisa -= a_later
+    saham = []
+    while sisa > 1 and jual_tk:
+        a = jual_tk.pop(0)
+        hasil = a["lot"] * 100 * a["harga"] * (1 - FEE_JUAL)
+        saham.append((a, hasil))
+        sisa -= hasil
+    if sisa <= 1:
+        pool_now -= a_now
+        pool_later -= a_later
+        pindah_now += a_now
+        pindah_later += a_later
+        for a, hasil in saham:
+            pindah_saham.append((a, hasil, item["kode"]))
+        cara = []
+        if a_now > 0:
+            cara.append("pindah kas")
+        if a_later > 0:
+            cara.append(f"pindah kas setelah settle (sempat: min {hari} hari ke PRZ)")
+        if saham:
+            cara.append("pindah saham lalu jual di OBERLIN")
+        hb_orders.append(dict(item, setelah_pindah=" + ".join(cara)))
     else:
-        kurang_besar += item["kurang"]
+        jual_tk = [a for a, _ in saham] + jual_tk      # tidak jadi dipakai
         aksi.append(dict(urut=7, akun="OBERLIN", aksi="TERLEWAT (KAS)", kode=item["kode"], lot=None, harga=None,
                          nilai=item["butuh"], tp="", sl="",
-                         alasan=f"kurang {rp(item['kurang'])}, kas TEKNIKAL menganggur tinggal {rp(pool)}"))
-if saran_pindah > 0:
+                         alasan=f"kurang {rp(k)}: kas settle, kas belum settle"
+                                + ("" if hari is not None and hari >= 3 else " (tidak sempat, PRZ terlalu dekat)")
+                                + " dan saham yang dijual hari ini tidak cukup"))
+saran_pindah = pindah_now + pindah_later
+if pindah_now > 0:
     aksi.append(dict(urut=4, akun="TEKNIKAL→OBERLIN", aksi="PINDAH KAS", kode="-", lot=None, harga=None,
-                     nilai=saran_pindah, tp="", sl="",
-                     alasan="mode PANIK: harmonic Besar didahulukan, kas TEKNIKAL menganggur"))
+                     nilai=pindah_now, tp="", sl="",
+                     alasan="sekarang, dari kas yang sudah settle (mode PANIK: harmonic Besar didahulukan)"))
+if pindah_later > 0:
+    aksi.append(dict(urut=4, akun="TEKNIKAL→OBERLIN", aksi="PINDAH KAS T+2", kode="-", lot=None, harga=None,
+                     nilai=pindah_later, tp="", sl="",
+                     alasan="setelah kas settle; antri harmonic dipasang setelah dana masuk OBERLIN"))
+for a, hasil, untuk in pindah_saham:
+    aksi.append(dict(urut=0, akun="TEKNIKAL→OBERLIN", aksi="PINDAH SAHAM", kode=a["kode"], lot=a["lot"],
+                     harga=None, nilai=None, tp="", sl="",
+                     alasan=f"lalu JUAL di OBERLIN (±Rp{rp(hasil)}), dananya untuk antri {untuk}"))
+    a["akun"] = "OBERLIN"
+    a["alasan"] = a["alasan"] + " · dijual di OBERLIN setelah pindah saham"
 for item in hb_orders:
     for bag, harga, dana, lot in item["legs"]:
         aksi.append(dict(urut=6, akun="OBERLIN", aksi="ANTRI BELI", kode=item["kode"], lot=lot, harga=harga,
                          nilai=lot * harga * 100, tp=rp(item["tp1"]), sl=f"{rp(item['stop'])} (close)",
                          alasan=f"{item['skala']} {item['pola']} · PRZ {bag}"
-                                + (" · setelah pindah kas" if item.get("setelah_pindah") else "")))
+                                + (f" · setelah {item['setelah_pindah']}" if item.get("setelah_pindah") else "")))
 
 aksi_df = pd.DataFrame(aksi)
 if not aksi_df.empty:
@@ -1642,7 +1723,8 @@ def build_state_json():
         p.at[i, "ob_tgl"] = e["ob_tgl"]
     return json.dumps({
         "versi": 2, "disimpan": now.strftime("%Y-%m-%d %H:%M"),
-        "kas": {"OBERLIN": kas_ob, "TEKNIKAL": kas_tk}, "modal_masuk_teknikal": modal_masuk,
+        "kas": {"OBERLIN": kas_ob, "TEKNIKAL": kas_tk}, "kas_settle_teknikal": kas_settle,
+        "modal_masuk_teknikal": modal_masuk,
         "posisi": clean_records(p), "antrian": clean_records(q_df),
     }, indent=2, ensure_ascii=False)
 
@@ -1671,10 +1753,17 @@ with tab_ring:
          COL["red"] if eksp_m > cap_m else COL["green"], f"{rp(eksp_m)} dari batas {rp(cap_m)}"),
         ("AKSI HARI INI", len(aksi_df), COL["amber"], "lihat tab AKSI HARI INI"),
     ]), unsafe_allow_html=True)
-    if saran_pindah > 0:
-        st.markdown(f'<div class="mg-move">⇄ <b>PINDAH KAS Rp {rp(saran_pindah)}</b> dari TEKNIKAL ke OBERLIN. '
-                    f'Kekurangan sinyal Besar {rp(kurang_besar)}, kas TEKNIKAL menganggur {rp(idle_tk)}. '
-                    'Pindahkan manual di Stockbit, lalu perbarui angka kas di tab STATE.</div>',
+    if saran_pindah > 0 or pindah_saham:
+        bag = []
+        if pindah_now > 0:
+            bag.append(f"<b>pindah kas Rp {rp(pindah_now)}</b> sekarang (sudah settle)")
+        if pindah_later > 0:
+            bag.append(f"<b>pindah kas Rp {rp(pindah_later)}</b> setelah settle T+2")
+        if pindah_saham:
+            bag.append("<b>pindah saham</b> " + ", ".join(f"{a['kode']} {rp(a['lot'])} lot" for a, _, _ in pindah_saham)
+                       + " lalu jual di OBERLIN")
+        st.markdown(f'<div class="mg-move">⇄ TEKNIKAL → OBERLIN: {"; ".join(bag)}. Kekurangan sinyal Besar '
+                    f'{rp(kurang_besar)}. Lakukan manual di Stockbit, lalu perbarui angka kas di tab STATE.</div>',
                     unsafe_allow_html=True)
     if pos_df.empty and q_df.empty and kas_ob == 0 and kas_tk == 0:
         st.markdown('<div class="mg-warn">State masih kosong. Muat file state atau impor portfolio.json '
@@ -1689,7 +1778,8 @@ with tab_aksi:
         AKSI_COL = {"JUAL": COL["red"], "CEK STOP": COL["red"], "CEK TP1": COL["green"],
                     "CEK TERISI": COL["cyan"], "CABUT ANTRIAN": COL["amber"], "UBAH TP": COL["amber"],
                     "UBAH SL": COL["amber"], "PASANG TP": COL["amber"], "PASANG SL": COL["amber"],
-                    "PINDAH KAS": COL["cyan"], "BELI": COL["green"], "ANTRI BELI": COL["violet"],
+                    "PINDAH KAS": COL["cyan"], "PINDAH KAS T+2": COL["cyan"], "PINDAH SAHAM": COL["cyan"],
+                    "BELI": COL["green"], "ANTRI BELI": COL["violet"],
                     "LENGKAPI": COL["dim"], "CEK DATA": COL["dim"], "LEWATI": COL["dim"],
                     "TERLEWAT (KAS)": COL["dim"]}
         html = ""
@@ -1774,7 +1864,7 @@ with tab_aksi:
     st.markdown("**Ringkasan jurnal (salin ke excel jurnal)**")
     lines = []
     for _, a in (aksi_df.iterrows() if not aksi_df.empty else []):
-        if a["aksi"] in ("BELI", "ANTRI BELI", "JUAL", "PINDAH KAS"):
+        if a["aksi"] in ("BELI", "ANTRI BELI", "JUAL", "PINDAH KAS", "PINDAH KAS T+2", "PINDAH SAHAM"):
             lot_txt = f"{int(a['lot'])} lot" if pd.notna(a["lot"]) else ""
             hg = f"@{rp(a['harga'])}" if pd.notna(a["harga"]) else ""
             nil = f"Rp{rp(a['nilai'])}" if pd.notna(a["nilai"]) else ""
