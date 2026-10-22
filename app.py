@@ -1,23 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-MESIN GABUNGAN — Tahap 1 (mesin inti)
-Compounding Terminal + Harmonic Board (skala Besar & Menengah) dalam satu pemindai.
+MESIN GABUNGAN — Tahap 2 (mesin inti + alokasi kas + daftar order + state JSON)
+Compounding Terminal (akun TEKNIKAL) + Harmonic Board Besar & Menengah (akun OBERLIN).
 
-Isi tahap 1:
-  1. Mode pasar dari IHSG 20 hari bursa (PANIK / NORMAL / EUFORIA)
-     + gerbang BEAR Compounding versi lama dan versi perbaikan (tutup lagi saat dasar baru).
-  2. Scan Harmonic (bullish, Besar + Menengah) memakai detect_patterns asli Harmonic Board,
-     ditambah: sentuh PRZ N hari lalu, flag PRZ lebar, status "pernah <=15% sejak C",
-     minimal hari ke PRZ dengan batas ARB.
-  3. Scan Compounding memakai logika analyze_stock asli, ditambah filter ARA,
-     red-flag, ambang BEAR versi perbaikan, dan rem euforia.
-  4. Tab uji kecocokan dengan aplikasi lama.
-Belum ada: alokasi kas, daftar order, state JSON (tahap 2).
+Tahap 1 (lulus uji kecocokan 23 Okt 2026):
+  - Mode pasar IHSG 20 hari bursa (PANIK / NORMAL / EUFORIA), gerbang BEAR versi perbaikan.
+  - Scan Harmonic bullish Besar + Menengah (detect_patterns asli) + Scan Compounding (analyze_stock asli).
+Tahap 2:
+  - Status sinyal harmonic SAH / TUA (aturan antrian GTC backtest).
+  - State JSON dua akun (posisi, antrian, kas), impor portfolio.json Compounding Terminal.
+  - Cek posisi (TP1 / stop / CL / K>80 / breakeven), cocokkan lot order TP-SL, status antrian.
+  - Alokasi kas per mode, saran pindah kas TEKNIKAL -> OBERLIN saat PANIK, daftar order siap ketik.
+  - Perbaikan tanggal IHSG yang tertinggal dari data saham, ringkasan jurnal siap salin.
+
+Sesi pemakaian:
+  - 15.00–16.15 WIB : sesi Compounding (candle berjalan, beli sebelum close, sama seperti app lama).
+  - setelah 16.15   : sesi sore (data final) untuk harmonic, cek posisi, rekap.
 
 Jalankan : streamlit run mesin_gabungan.py
 Butuh    : streamlit>=1.50, yfinance, pandas, numpy
-Data     : Yahoo Finance. Candle harian baru representatif setelah ±16.15 WIB.
 """
+import json
 import math
 import os
 from datetime import datetime, timedelta, timezone
@@ -65,6 +68,14 @@ HB_SCALES = {"Besar": (5.0, 150), "Menengah": (3.0, 80)}   # mult ATR, umur maks
 HB_MAX_DIST = 15.0           # jarak maks harga ke PRZ (%)
 HB_RR_MIN = 0.5              # R:R rencana minimal (sama dengan backtest)
 HB_VAL_MIN = 1.0             # value terendah 20 hari minimal (miliar)
+HB_UMUR_MAX = 220            # antrian GTC berlaku maks 220 hari kalender sejak sinyal aktif (backtest)
+HB_SENTUH_MAX = 3            # PRZ disentuh pertama kali > 3 hari bursa lalu -> TUA, tanpa order
+HB_PORSI = 0.10              # dana per antrian = 10% ekuitas (2 antrian per sinyal)
+HB_MENENGAH_CAP = 0.20       # eksposur Menengah maks 20% ekuitas OBERLIN
+CT_PORSI = 0.20              # Compounding 20% Total Modal Masuk per posisi
+FEE_BELI = 0.0015
+FEE_JUAL = 0.0025
+TARIF_MATERAI = 10_000
 HB_LEBAR_X = 2.0             # flag PRZ lebar: risiko dari antri atas > 2x potensi ke TP1
 ARB_DEFAULT = 7.0            # ARB asimetris 7% (SK Kep-00157/BEI/10-2026, s.d. 31 Des 2026)
 
@@ -594,7 +605,7 @@ def _clean_index(d):
     return d
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def load_all(codes, period="2y"):
     """Unduh semua emiten sekali (batch 100). Data mentah, belum dibuang baris volume nol."""
     data = {}
@@ -628,7 +639,7 @@ def load_all(codes, period="2y"):
     return data
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def load_ihsg(period="2y"):
     if yf is None:
         return None
@@ -757,7 +768,7 @@ def enrich_signal(p, d, piv, lk):
                 risiko_atas=risiko_atas, potensi_atas=potensi_atas, lebar=lebar)
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def scan_harmonic(codes):
     data = load_all(codes)
     rows, gagal = [], 0
@@ -794,7 +805,22 @@ def scan_harmonic(codes):
                     kategori = "PERNAH ≤15%"
                 else:
                     continue
+                last_dt = d.index[-1]
+                aktif_dt = d.index[e["aktif_idx"]] if e["aktif_idx"] is not None else last_dt
+                umur_sinyal = int((last_dt - aktif_dt).days)
+                after_c = h[p["C"][0] + 1:]
+                tembus_c = bool(len(after_c) and float(after_c.max()) > p["C"][1])
+                sentuh_n = (n - 1 - e["sentuh_idx"]) if e["sentuh_idx"] is not None else None
+                if tembus_c:
+                    st_order = "BATAL (tembus C)"
+                elif umur_sinyal > HB_UMUR_MAX:
+                    st_order = "KEDALUWARSA"
+                elif sentuh_n is not None and sentuh_n > HB_SENTUH_MAX:
+                    st_order = "TUA"
+                else:
+                    st_order = "SAH"
                 rows.append({
+                    "Status Order": st_order, "Harga C": p["C"][1], "Umur sinyal (hari)": umur_sinyal,
                     "Kode": t, "Skala": skala, "Pola": p["pattern"], "Status": p["status"],
                     "Kategori": kategori, "Harga": p["price"], "Jarak PRZ %": p["dist"],
                     "Antri Atas": e["top"], "Antri Bawah": e["bot"],
@@ -908,13 +934,14 @@ def ct_signal(df_stock):
     prev_close = float(close.iloc[-2])
     high_now = float(high.iloc[-1])
     kunci_ara = close_now >= prev_close * (1 + ara_pct(prev_close)) * 0.99 and close_now >= high_now
-    return dict(close=float(close_now), ll20=float(ll20), hh20=float(hh20), stoch_k=float(stoch_k_now),
+    llock = float(low.tail(20).min())   # CL yang dikunci saat beli (sama dengan form Beli app lama)
+    return dict(close=float(close_now), ll20=float(ll20), hh20=float(hh20), stoch_k=float(stoch_k_now), llock=llock,
                 vol_ratio=float(vol_ratio), fase=int(fase), buy_confidence=float(buy_conf),
                 val_ma20=float(val_ma20) / 1e9, kunci_ara=bool(kunci_ara),
                 chg=(float(close_now) / prev_close - 1) * 100)
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def scan_compounding(codes):
     data = load_all(codes)
     rows = []
@@ -960,7 +987,213 @@ def ct_table(rows, mm):
 
 
 # =============================================================================
-# 8. ANTARMUKA
+# 8. STATE, CEK POSISI & ALOKASI
+# =============================================================================
+AKUN = ["OBERLIN", "TEKNIKAL"]
+ASAL = ["compounding", "harmonic_besar", "harmonic_menengah", "warisan", "deviasi"]
+POS_COLS = ["akun", "kode", "asal", "lot", "avg", "tanggal_beli", "ll20", "ob_streak", "ob_tgl",
+            "tp1", "stop", "harga_c", "order_tp", "order_sl", "catatan"]
+Q_COLS = ["akun", "kode", "asal", "bagian", "harga", "lot", "tanggal_pasang", "tp1", "stop",
+          "harga_c", "catatan"]
+NUM_POS = ["lot", "avg", "ll20", "ob_streak", "tp1", "stop", "harga_c"]
+NUM_Q = ["harga", "lot", "tp1", "stop", "harga_c"]
+
+
+def to_frame(records, cols, num_cols):
+    df = pd.DataFrame(records if records else [], columns=cols)
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+    df = df[cols].copy()
+    for c in cols:
+        if c in num_cols:
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype(float)
+        else:
+            df[c] = df[c].fillna("").astype(str).replace({"nan": "", "None": ""})
+    df["kode"] = df["kode"].str.upper().str.replace(".JK", "", regex=False).str.strip()
+    return df.reset_index(drop=True)
+
+
+def clean_records(df):
+    out = []
+    for r in df.to_dict("records"):
+        rr = {}
+        for k, v in r.items():
+            if isinstance(v, (float, np.floating)):
+                rr[k] = None if np.isnan(v) else float(v)
+            elif isinstance(v, (np.integer,)):
+                rr[k] = int(v)
+            else:
+                rr[k] = v
+        out.append(rr)
+    return out
+
+
+def num(v, default=0.0):
+    try:
+        v = float(v)
+        return default if np.isnan(v) else v
+    except Exception:
+        return default
+
+
+def to_ts(s):
+    try:
+        if s is None or str(s).strip() == "":
+            return None
+        return pd.Timestamp(str(s)[:10])
+    except Exception:
+        return None
+
+
+def parse_orders(text):
+    """'476@790, 471@820' -> [(476, 790), (471, 820)]. Titik ribuan diabaikan."""
+    out = []
+    for part in str(text or "").replace(";", ",").split(","):
+        part = part.strip().replace(" ", "").replace(".", "")
+        if "@" not in part:
+            continue
+        a, b = part.split("@", 1)
+        try:
+            out.append((int(float(a)), float(b)))
+        except Exception:
+            continue
+    return out
+
+
+def import_ct_json(js):
+    """portfolio.json Compounding Terminal -> baris posisi akun TEKNIKAL."""
+    rows = []
+    for p in js.get("positions", []):
+        rows.append(dict(
+            akun="TEKNIKAL", kode=str(p.get("ticker", "")).upper(),
+            asal="compounding" if p.get("asal", "compounding") == "compounding" else "warisan",
+            lot=p.get("lots"), avg=p.get("entry_price"), tanggal_beli=p.get("tanggal_beli") or "",
+            ll20=p.get("ll20_terkunci"), ob_streak=p.get("ob_streak", 0),
+            ob_tgl=p.get("last_ob_check") or "", tp1=None, stop=None, harga_c=None,
+            order_tp="", order_sl="", catatan="impor Compounding Terminal"))
+    return rows, float(js.get("current_cash", 0) or 0), float(
+        js.get("total_modal_masuk", js.get("initial_capital", 0)) or 0)
+
+
+def series_of(d):
+    c = d["Close"].dropna()
+    h = d["High"].reindex(c.index)
+    l = d["Low"].reindex(c.index)
+    return c, h, l
+
+
+def eval_ct_position(r, d):
+    """ob_streak dihitung per candle (hari yang terlewat tetap terhitung). Urutan sama dengan backtest."""
+    c, h, l = series_of(d)
+    K = (100 * (c - l.rolling(10).min()) / (h.rolling(10).max() - l.rolling(10).min())).rolling(5).mean()
+    tb, obt = to_ts(r["tanggal_beli"]), to_ts(r["ob_tgl"])
+    ob = int(num(r["ob_streak"]))
+    ll, avg = num(r["ll20"]), num(r["avg"])
+    if obt is not None:
+        todo = [t for t in c.index if t > obt]
+    elif tb is not None:
+        todo = [t for t in c.index if t >= tb]
+    else:
+        todo = list(c.index[-1:])
+    trig = None
+    for t in todo:
+        k = K.get(t, np.nan)
+        if tb is not None and t <= tb:          # hari beli: hanya catat streak, tanpa exit
+            ob = 1 if (pd.notna(k) and k > 80) else 0
+            obt = t
+            continue
+        if ll > 0 and c[t] < ll:
+            trig, obt = ("CL (close < LL20)", t), t
+            ob = 0
+            break
+        ob = ob + 1 if (pd.notna(k) and k > 80) else 0
+        obt = t
+        if ob >= 2:
+            trig = ("K>80 dua hari", t)
+            break
+        if ob >= 1 and avg > 0 and l[t] <= avg:
+            trig = ("pengaman breakeven", t)
+            break
+    return dict(ob=ob, ob_tgl=obt.strftime("%Y-%m-%d") if obt is not None else "",
+                trig=trig, k=float(K.iloc[-1]) if pd.notna(K.iloc[-1]) else None)
+
+
+def eval_hb_position(r, d):
+    c, h, l = series_of(d)
+    tb = to_ts(r["tanggal_beli"])
+    tp1, stop = num(r["tp1"]), num(r["stop"])
+    idx = [t for t in c.index if tb is None or t > tb]
+    for t in idx:
+        if tp1 > 0 and h[t] >= tp1:
+            return ("TP1 tersentuh", t)
+        if stop > 0 and c[t] < stop:
+            return ("close di bawah stop", t)
+    return None
+
+
+def eval_queue(r, d, last_dt):
+    c, h, l = series_of(d)
+    tp = to_ts(r["tanggal_pasang"])
+    harga, cpx = num(r["harga"]), num(r["harga_c"])
+    idx = [t for t in c.index if tp is None or t > tp]
+    for t in idx:
+        if harga > 0 and l[t] <= harga:
+            return ("TERISI?", t)
+        if cpx > 0 and h[t] > cpx:
+            return ("CABUT: tembus C", t)
+    if tp is not None and (last_dt - tp).days > HB_UMUR_MAX:
+        return ("CABUT: lewat 220 hari", last_dt)
+    return None
+
+
+def lot_hb(dana, harga):
+    if harga <= 0:
+        return 0
+    return int(dana // (harga * 100 * (1 + FEE_BELI)))
+
+
+def sesi_info(now):
+    hm = (now.hour, now.minute)
+    if now.weekday() >= 5:
+        return "LIBUR", "Bursa tutup. Data = close hari bursa terakhir."
+    if hm < (15, 0):
+        return "PAGI", "Data belum representatif. Jangan ambil keputusan sekarang."
+    if hm < (16, 15):
+        return "SESI COMPOUNDING", "Candle hari ini masih berjalan. Ambil sinyal Compounding, beli sebelum close."
+    return "SESI SORE", "Data final. Harmonic, cek posisi, antrian, dan rekap."
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def ihsg_history_fallback():
+    try:
+        d = yf.Ticker("^JKSE").history(period="10d", interval="1d", auto_adjust=False)
+        if d is None or d.empty:
+            return None
+        s = d["Close"].dropna()
+        idx = pd.to_datetime(s.index)
+        if idx.tz is not None:
+            idx = idx.tz_localize(None)
+        s.index = idx.normalize()
+        return s
+    except Exception:
+        return None
+
+
+def ihsg_fixed(close, stock_last):
+    if close.index[-1] >= stock_last:
+        return close, False
+    fb = ihsg_history_fallback()
+    if fb is not None:
+        add = fb[fb.index > close.index[-1]]
+        if len(add):
+            close = pd.concat([close, add]).sort_index()
+            close = close[~close.index.duplicated(keep="last")]
+    return close, close.index[-1] < stock_last
+
+
+# =============================================================================
+# 9. ANTARMUKA
 # =============================================================================
 st.set_page_config(page_title="Mesin Gabungan", page_icon="◆", layout="wide")
 
@@ -986,6 +1219,10 @@ st.markdown(f"""
 .mg-card .s {{ color:{COL['dim']}; font-size:11px; margin-top:2px; }}
 .mg-warn {{ border:1px solid #2a1f10; border-left:3px solid {COL['amber']}; background:#0f0c07;
   padding:10px 14px; color:{COL['text']}; font-size:13px; margin:6px 0 10px 0; }}
+.mg-err {{ border:1px solid #2a1016; border-left:3px solid {COL['red']}; background:#12070a;
+  padding:10px 14px; color:{COL['text']}; font-size:13px; margin:6px 0 10px 0; }}
+.mg-move {{ border:1px solid #10202a; border-left:4px solid {COL['cyan']}; background:#06121a;
+  padding:12px 16px; color:{COL['text']}; font-size:15px; margin:6px 0 12px 0; }}
 @media (max-width: 640px) {{
   .mg-grid {{ grid-template-columns:repeat(2,1fr); }} .mg-card .v {{ font-size:18px; }}
   .mg-title {{ font-size:18px; }} }}
@@ -998,7 +1235,7 @@ div.stButton > button:hover {{ background:{COL['green']}; color:#000; }}
 st.markdown("""
 <div class="mg-head">
   <div class="mg-title">◆ MESIN GABUNGAN</div>
-  <div class="mg-sub">TAHAP 1 // MODE PASAR · HARMONIC BESAR+MENENGAH · COMPOUNDING</div>
+  <div class="mg-sub">TAHAP 2 // MODE PASAR · ALOKASI KAS · DAFTAR ORDER · STATE JSON</div>
 </div>""", unsafe_allow_html=True)
 
 if yf is None:
@@ -1018,165 +1255,573 @@ def rp(v):
     return f"{v:,.0f}".replace(",", ".")
 
 
+# ---------------- state sesi ----------------
+ss = st.session_state
+ss.setdefault("ver", 0)
+ss.setdefault("pos_base", to_frame([], POS_COLS, NUM_POS))
+ss.setdefault("q_base", to_frame([], Q_COLS, NUM_Q))
+ss.setdefault("meta", {"kas_OBERLIN": 0.0, "kas_TEKNIKAL": 0.0, "modal_masuk": 0.0})
+ss.setdefault("_up_sig", None)
+ss.setdefault("_ct_sig", None)
+
 with st.sidebar:
     st.markdown("### ▌PARAMETER")
+    basis_opt = st.radio("Dasar porsi harmonic (10% + 10%)",
+                         ["Ekuitas OBERLIN + TEKNIKAL", "Ekuitas OBERLIN saja"],
+                         help="Backtest memakai kas bersama, jadi dasarnya ekuitas gabungan. "
+                              "Saat PANIK, kekurangan kas OBERLIN ditutup lewat saran pindah kas.")
     arb = st.number_input("Batas ARB harian (%)", 1.0, 35.0, ARB_DEFAULT, 0.5,
-                          help="ARB asimetris 7% berlaku 19 Okt s.d. 31 Des 2026. "
-                               "Dipakai untuk menghitung minimal berapa hari harga bisa sampai PRZ.")
+                          help="ARB asimetris 7% berlaku 19 Okt s.d. 31 Des 2026.")
     if st.button("▶ TARIK ULANG DATA", width="stretch"):
         load_all.clear()
         load_ihsg.clear()
+        ihsg_history_fallback.clear()
         scan_harmonic.clear()
         scan_compounding.clear()
         st.rerun()
-    st.caption(f"Universe gabungan {len(ALL_TICKERS)} kode "
-               f"(Harmonic {len(HB_TICKERS)}, Compounding {len(CT_TICKERS)}). Data Yahoo 2 tahun, "
-               "cache 6 jam.")
+    st.caption(f"Universe {len(ALL_TICKERS)} kode. Data Yahoo 2 tahun, cache 15 menit.")
 
 now = datetime.now(WIB)
-with st.spinner("Menarik data IHSG..."):
-    ihsg = load_ihsg()
-if ihsg is None or len(ihsg) < 260:
-    st.error("Data IHSG (^JKSE) gagal ditarik. Coba tarik ulang beberapa menit lagi.")
-    st.stop()
-mm = market_mode(ihsg)
+sesi, sesi_txt = sesi_info(now)
 
-with st.spinner(f"Menarik data {len(ALL_TICKERS)} emiten & memindai... (pertama kali bisa 2-4 menit)"):
+with st.spinner(f"Menarik data {len(ALL_TICKERS)} emiten & memindai... (bisa 2-4 menit)"):
+    data_all = load_all(ALL_TICKERS)
     hb_df, hb_gagal = scan_harmonic(ALL_TICKERS)
     ct_rows = scan_compounding(ALL_TICKERS)
-    n_loaded = len(load_all(ALL_TICKERS))
+if not data_all:
+    st.error("Data saham gagal ditarik. Coba tarik ulang beberapa menit lagi.")
+    st.stop()
+stock_last = pd.Series([d.index[-1] for d in data_all.values()]).mode().iloc[0]
+ihsg_raw = load_ihsg()
+if ihsg_raw is None or len(ihsg_raw) < 260:
+    st.error("Data IHSG (^JKSE) gagal ditarik. Coba tarik ulang beberapa menit lagi.")
+    st.stop()
+ihsg, ihsg_telat = ihsg_fixed(ihsg_raw, stock_last)
+mm = market_mode(ihsg)
 
-tgl_data = mm["tanggal"]
-if tgl_data.date() == now.date() and (now.hour, now.minute) < (16, 15):
-    st.markdown('<div class="mg-warn"><b>Candle hari ini belum final.</b> Data Yahoo baru representatif '
-                'setelah ±16.15 WIB. Jangan ambil keputusan dari angka ini; buka lagi sore dan tekan '
-                '"Tarik ulang data".</div>', unsafe_allow_html=True)
-st.caption(f"Data per {tgl_data.strftime('%d %b %Y')} · dibuka {now.strftime('%d %b %Y %H:%M')} WIB · "
-           f"{n_loaded} emiten termuat")
+st.markdown(cards([
+    ("SESI", sesi, COL["cyan"] if sesi.startswith("SESI") else COL["amber"], sesi_txt),
+    ("DATA SAHAM", stock_last.strftime("%d %b %Y"), COL["text"], f"{len(data_all)} emiten termuat"),
+    ("DATA IHSG", mm["tanggal"].strftime("%d %b %Y"), COL["red"] if ihsg_telat else COL["text"],
+     "TERTINGGAL dari data saham" if ihsg_telat else "sinkron dengan data saham"),
+    ("DIBUKA", now.strftime("%d %b %H:%M"), COL["dim"], "WIB"),
+]), unsafe_allow_html=True)
+if ihsg_telat:
+    st.markdown(f'<div class="mg-err"><b>Mode pasar memakai IHSG tanggal {mm["tanggal"].strftime("%d %b %Y")}</b>, '
+                f'sedangkan data saham sudah {stock_last.strftime("%d %b %Y")}. Yahoo belum memperbarui ^JKSE. '
+                'Kalau IHSG sedang dekat batas -5% / +10%, cek angka IHSG manual sebelum memutuskan.</div>',
+                unsafe_allow_html=True)
 
-tab_mode, tab_hb, tab_ct, tab_uji = st.tabs(["▌MODE PASAR", "▌HARMONIC", "▌COMPOUNDING", "▌UJI KECOCOKAN"])
+tab_ring, tab_aksi, tab_state, tab_hb, tab_ct = st.tabs(
+    ["▌RINGKASAN", "▌AKSI HARI INI", "▌STATE & JURNAL", "▌HARMONIC", "▌COMPOUNDING"])
 
-# ----------------------------------------------------------------- MODE PASAR
-with tab_mode:
-    gl, gb = mm["gate_lama"], mm["gate_baru"]
-    aturan = {"PANIK": "Harmonic Besar didahulukan memakai cash, sisanya Compounding.",
-              "NORMAL": "Compounding penuh, Harmonic Besar dari sisa kas.",
+# ----------------------------------------------------------------- STATE (dibaca lebih dulu)
+with tab_state:
+    st.markdown("**1. Muat state**")
+    c1, c2 = st.columns(2)
+    up = c1.file_uploader("State dashboard (state_gabungan_*.json)", type="json", key="up_state")
+    if up is not None and ss["_up_sig"] != (up.name, up.size):
+        try:
+            js = json.loads(up.getvalue().decode("utf-8"))
+            ss["pos_base"] = to_frame(js.get("posisi", []), POS_COLS, NUM_POS)
+            ss["q_base"] = to_frame(js.get("antrian", []), Q_COLS, NUM_Q)
+            kas = js.get("kas", {})
+            ss["meta"] = {"kas_OBERLIN": float(kas.get("OBERLIN", 0) or 0),
+                          "kas_TEKNIKAL": float(kas.get("TEKNIKAL", 0) or 0),
+                          "modal_masuk": float(js.get("modal_masuk_teknikal", 0) or 0)}
+            ss["_up_sig"] = (up.name, up.size)
+            ss["ver"] += 1
+            st.rerun()
+        except Exception as ex:
+            st.error(f"File state tidak valid: {ex}")
+    upc = c2.file_uploader("Impor portfolio.json Compounding Terminal → TEKNIKAL", type="json", key="up_ct")
+    if upc is not None and ss["_ct_sig"] != (upc.name, upc.size):
+        try:
+            js = json.loads(upc.getvalue().decode("utf-8"))
+            rows, kas_ct, modal_ct = import_ct_json(js)
+            base = ss["pos_base"]
+            base = base[base["akun"] != "TEKNIKAL"]
+            ss["pos_base"] = to_frame(clean_records(base) + rows, POS_COLS, NUM_POS)
+            ss["meta"]["kas_TEKNIKAL"] = kas_ct
+            ss["meta"]["modal_masuk"] = modal_ct
+            ss["_ct_sig"] = (upc.name, upc.size)
+            ss["ver"] += 1
+            st.rerun()
+        except Exception as ex:
+            st.error(f"portfolio.json tidak valid: {ex}")
+    st.caption("Impor mengganti semua posisi TEKNIKAL dengan isi portfolio.json, mengisi kas TEKNIKAL dan "
+               "Total Modal Masuk. Posisi insting (GOTO, HRUM) ubah asalnya jadi 'deviasi' di tabel.")
+
+    st.markdown("**2. Kas tersedia (samakan dengan Trading Balance Stockbit, sudah dikurangi antrian ACTIVE)**")
+    v = ss["ver"]
+    k1, k2, k3 = st.columns(3)
+    kas_ob = k1.number_input("Kas OBERLIN (Rp)", 0.0, 1e12, float(ss["meta"]["kas_OBERLIN"]), 100_000.0,
+                             format="%.0f", key=f"kas_ob_{v}")
+    kas_tk = k2.number_input("Kas TEKNIKAL (Rp)", 0.0, 1e12, float(ss["meta"]["kas_TEKNIKAL"]), 100_000.0,
+                             format="%.0f", key=f"kas_tk_{v}")
+    modal_masuk = k3.number_input("Total Modal Masuk TEKNIKAL (Rp)", 0.0, 1e12, float(ss["meta"]["modal_masuk"]),
+                                  1_000_000.0, format="%.0f", key=f"mm_{v}",
+                                  help="Dasar sizing Compounding 20% per posisi, sama dengan app lama.")
+    ss["meta"] = {"kas_OBERLIN": kas_ob, "kas_TEKNIKAL": kas_tk, "modal_masuk": modal_masuk}
+
+    st.markdown("**3. Posisi** (tambah/hapus baris langsung di tabel)")
+    pos_df = st.data_editor(
+        ss["pos_base"], key=f"ed_pos_{v}", num_rows="dynamic", hide_index=True, width="stretch",
+        column_config={
+            "akun": st.column_config.SelectboxColumn(options=AKUN, required=True),
+            "asal": st.column_config.SelectboxColumn(options=ASAL, required=True),
+            "lot": st.column_config.NumberColumn(format="%d"),
+            "avg": st.column_config.NumberColumn(format="%.2f"),
+            "tanggal_beli": st.column_config.TextColumn(help="YYYY-MM-DD"),
+            "ll20": st.column_config.NumberColumn("LL20 kunci", format="%.0f", help="Compounding: CL"),
+            "ob_streak": st.column_config.NumberColumn(format="%d", help="Diisi otomatis, jangan diubah"),
+            "ob_tgl": st.column_config.TextColumn(help="Candle terakhir yang dihitung, otomatis"),
+            "tp1": st.column_config.NumberColumn(format="%.0f", help="Harmonic: TP1"),
+            "stop": st.column_config.NumberColumn(format="%.0f", help="Harmonic: stop basis close"),
+            "harga_c": st.column_config.NumberColumn(format="%.0f", help="Harmonic: harga titik C"),
+            "order_tp": st.column_config.TextColumn(help="Order TP terpasang, contoh 476@790, 471@820"),
+            "order_sl": st.column_config.TextColumn(help="Order SL terpasang, contoh 947@635"),
+        })
+    st.markdown("**4. Antrian beli harmonic terpasang**")
+    q_df = st.data_editor(
+        ss["q_base"], key=f"ed_q_{v}", num_rows="dynamic", hide_index=True, width="stretch",
+        column_config={
+            "akun": st.column_config.SelectboxColumn(options=AKUN, required=True),
+            "asal": st.column_config.SelectboxColumn(options=ASAL, required=True),
+            "bagian": st.column_config.SelectboxColumn(options=["atas", "bawah", "gabung"]),
+            "harga": st.column_config.NumberColumn(format="%.0f"),
+            "lot": st.column_config.NumberColumn(format="%d"),
+            "tanggal_pasang": st.column_config.TextColumn(help="YYYY-MM-DD"),
+            "tp1": st.column_config.NumberColumn(format="%.0f"),
+            "stop": st.column_config.NumberColumn(format="%.0f"),
+            "harga_c": st.column_config.NumberColumn(format="%.0f"),
+        })
+    pos_df = to_frame(clean_records(pos_df), POS_COLS, NUM_POS)
+    q_df = to_frame(clean_records(q_df), Q_COLS, NUM_Q)
+    pos_df = pos_df[pos_df["kode"] != ""].reset_index(drop=True)
+    q_df = q_df[q_df["kode"] != ""].reset_index(drop=True)
+
+
+# ----------------------------------------------------------------- data posisi di luar universe
+@st.cache_data(ttl=900, show_spinner=False)
+def load_extra(codes):
+    return load_all(codes, period="2y") if codes else {}
+
+
+need = sorted(set(pos_df["kode"]).union(set(q_df["kode"])) - set(data_all))
+extra = load_extra(tuple(need)) if need else {}
+
+
+def get_df(k):
+    return data_all.get(k) if k in data_all else extra.get(k)
+
+
+def last_close(k, default):
+    d = get_df(k)
+    if d is None or d["Close"].dropna().empty:
+        return default
+    return float(d["Close"].dropna().iloc[-1])
+
+
+# ----------------------------------------------------------------- cek posisi
+aksi = []          # dict(urut, akun, aksi, kode, lot, harga, nilai, tp, sl, alasan)
+pos_eval = {}      # index -> hasil (ob update)
+mv = {"OBERLIN": 0.0, "TEKNIKAL": 0.0}
+selesai_hb = set()  # (akun, kode) posisi harmonic yang sudah TP1/stop -> antrian saudara dicabut
+for i, r in pos_df.iterrows():
+    d = get_df(r["kode"])
+    lot, avg = num(r["lot"]), num(r["avg"])
+    px = last_close(r["kode"], avg)
+    mv[r["akun"]] = mv.get(r["akun"], 0.0) + lot * 100 * px
+    if d is None:
+        aksi.append(dict(urut=9, akun=r["akun"], aksi="CEK DATA", kode=r["kode"], lot=lot, harga=None,
+                         nilai=None, tp="", sl="", alasan="data Yahoo tidak tersedia"))
+        continue
+    if r["asal"] == "compounding":
+        e = eval_ct_position(r, d)
+        pos_eval[i] = e
+        if num(r["ll20"]) <= 0:
+            aksi.append(dict(urut=8, akun=r["akun"], aksi="LENGKAPI", kode=r["kode"], lot=lot, harga=None,
+                             nilai=None, tp="", sl="", alasan="LL20 terkunci belum diisi, CL tidak bisa dicek"))
+        if e["trig"]:
+            hasil = "untung" if px > avg else "rugi"
+            aksi.append(dict(urut=1, akun=r["akun"], aksi="JUAL", kode=r["kode"], lot=lot, harga=px,
+                             nilai=lot * 100 * px, tp="", sl="",
+                             alasan=f"Compounding: {e['trig'][0]} ({e['trig'][1].strftime('%d %b')}), {hasil}"))
+    elif r["asal"] in ("harmonic_besar", "harmonic_menengah"):
+        trg = eval_hb_position(r, d)
+        if num(r["tp1"]) <= 0 or num(r["stop"]) <= 0:
+            aksi.append(dict(urut=8, akun=r["akun"], aksi="LENGKAPI", kode=r["kode"], lot=lot, harga=None,
+                             nilai=None, tp="", sl="", alasan="TP1/stop pola belum diisi"))
+        if trg:
+            selesai_hb.add((r["akun"], r["kode"]))
+            if trg[0] == "TP1 tersentuh":
+                aksi.append(dict(urut=1, akun=r["akun"], aksi="CEK TP1", kode=r["kode"], lot=lot,
+                                 harga=num(r["tp1"]), nilai=None, tp="", sl="",
+                                 alasan=f"TP1 tersentuh {trg[1].strftime('%d %b')}: pastikan terjual semua"))
+            else:
+                aksi.append(dict(urut=1, akun=r["akun"], aksi="JUAL", kode=r["kode"], lot=lot, harga=px,
+                                 nilai=lot * 100 * px, tp="", sl="",
+                                 alasan=f"close {rp(px)} di bawah stop {rp(num(r['stop']))} ({trg[1].strftime('%d %b')})"))
+        # cocokkan order TP/SL dengan lot
+        for kol, nama, harga_sistem in (("order_tp", "TP", num(r["tp1"])), ("order_sl", "SL", num(r["stop"]))):
+            od = parse_orders(r[kol])
+            tot = sum(a for a, _ in od)
+            if not od:
+                aksi.append(dict(urut=3, akun=r["akun"], aksi=f"PASANG {nama}", kode=r["kode"], lot=lot,
+                                 harga=harga_sistem or None, nilai=None, tp="", sl="",
+                                 alasan=f"belum ada order {nama} tercatat" +
+                                        (" (stop basis close: jual manual kalau close di bawah)" if nama == "SL" else "")))
+            elif tot != int(lot):
+                aksi.append(dict(urut=2, akun=r["akun"], aksi=f"UBAH {nama}", kode=r["kode"], lot=lot,
+                                 harga=harga_sistem or None, nilai=None, tp="", sl="",
+                                 alasan=f"lot order {nama} {tot} ≠ dipegang {int(lot)}"))
+    else:  # warisan / deviasi: hanya cocokkan lot order yang tercatat
+        for kol, nama in (("order_tp", "TP"), ("order_sl", "SL")):
+            od = parse_orders(r[kol])
+            tot = sum(a for a, _ in od)
+            if od and tot != int(lot):
+                aksi.append(dict(urut=2, akun=r["akun"], aksi=f"UBAH {nama}", kode=r["kode"], lot=lot, harga=None,
+                                 nilai=None, tp="", sl="",
+                                 alasan=f"{r['asal']}: lot order {nama} {tot} ≠ dipegang {int(lot)}"))
+        stop = num(r["stop"])
+        if stop > 0 and px < stop:
+            aksi.append(dict(urut=1, akun=r["akun"], aksi="CEK STOP", kode=r["kode"], lot=lot, harga=px,
+                             nilai=None, tp="", sl="", alasan=f"{r['asal']}: close {rp(px)} di bawah stop {rp(stop)}"))
+
+# ----------------------------------------------------------------- cek antrian
+dana_antri = {"OBERLIN": 0.0, "TEKNIKAL": 0.0}
+q_eval = {}
+for i, r in q_df.iterrows():
+    dana = num(r["harga"]) * num(r["lot"]) * 100 * (1 + FEE_BELI)
+    d = get_df(r["kode"])
+    res = eval_queue(r, d, stock_last) if d is not None else None
+    if (r["akun"], r["kode"]) in selesai_hb:
+        res = ("CABUT: posisi saudara sudah selesai", stock_last)
+    q_eval[i] = res
+    if res and res[0] == "TERISI?":
+        aksi.append(dict(urut=2, akun=r["akun"], aksi="CEK TERISI", kode=r["kode"], lot=num(r["lot"]),
+                         harga=num(r["harga"]), nilai=None, tp="", sl="",
+                         alasan=f"low menyentuh {rp(num(r['harga']))} ({res[1].strftime('%d %b')}). Kalau terisi, "
+                                f"pindahkan ke posisi (tombol di tab AKSI)"))
+        dana_antri[r["akun"]] += dana       # sampai dikonfirmasi, anggap masih terkunci
+    elif res:
+        aksi.append(dict(urut=2, akun=r["akun"], aksi="CABUT ANTRIAN", kode=r["kode"], lot=num(r["lot"]),
+                         harga=num(r["harga"]), nilai=None, tp="", sl="", alasan=res[0].replace("CABUT: ", "")))
+    else:
+        dana_antri[r["akun"]] += dana
+
+ekuitas = {a: (kas_ob if a == "OBERLIN" else kas_tk) + mv.get(a, 0.0) + dana_antri.get(a, 0.0) for a in AKUN}
+basis_hb = ekuitas["OBERLIN"] + (ekuitas["TEKNIKAL"] if basis_opt.startswith("Ekuitas OBERLIN +") else 0.0)
+alok_hb = HB_PORSI * basis_hb
+dipegang = set(pos_df["kode"]) | set(q_df["kode"])
+eksp_m = float(sum(num(r["lot"]) * 100 * last_close(r["kode"], num(r["avg"]))
+                   for _, r in pos_df.iterrows() if r["akun"] == "OBERLIN" and r["asal"] == "harmonic_menengah")
+               + sum(num(r["harga"]) * num(r["lot"]) * 100
+                     for i, r in q_df.iterrows() if r["asal"] == "harmonic_menengah"
+                     and (not q_eval.get(i) or q_eval[i][0] == "TERISI?")))
+cap_m = HB_MENENGAH_CAP * ekuitas["OBERLIN"]
+
+# ----------------------------------------------------------------- Compounding: order beli TEKNIKAL
+ctdf, amb_lama, amb_baru = ct_table(ct_rows, mm)
+ct_orders, ct_info = [], []
+kas_tk_sisa = kas_tk
+alok_ct = CT_PORSI * modal_masuk
+held_tk = set(pos_df.loc[pos_df["akun"] == "TEKNIKAL", "kode"])
+if not ctdf.empty:
+    llock_map = {m["ticker"]: m["llock"] for m in ct_rows}
+    for _, r in ctdf.iterrows():
+        if r["Status"] != "BELI":
+            continue
+        if r["Kode"] in held_tk or r["Kode"] in dipegang:
+            ct_info.append((r["Kode"], "sudah dipegang"))
+            continue
+        harga = float(r["Close"])
+        lot = int(max(alok_ct - TARIF_MATERAI, 0) // (harga * 100 * (1 + FEE_BELI)))
+        if lot <= 0:
+            ct_info.append((r["Kode"], "Total Modal Masuk belum diisi" if modal_masuk <= 0 else "dana tidak cukup 1 lot"))
+            continue
+        nilai = lot * 100 * harga
+        cost = nilai * (1 + FEE_BELI) + (TARIF_MATERAI if nilai > 10e6 else 0)
+        if cost > kas_tk_sisa:
+            ct_info.append((r["Kode"], f"terlewat (kas): butuh {rp(cost)}, sisa {rp(kas_tk_sisa)}"))
+            aksi.append(dict(urut=7, akun="TEKNIKAL", aksi="TERLEWAT (KAS)", kode=r["Kode"], lot=lot, harga=harga,
+                             nilai=nilai, tp="", sl="", alasan=f"Compounding conf {r['Buy Conf']:.0f}"))
+            continue
+        kas_tk_sisa -= cost
+        ct_orders.append(dict(kode=r["Kode"], lot=lot, harga=harga, llock=llock_map.get(r["Kode"], 0.0)))
+        aksi.append(dict(urut=5, akun="TEKNIKAL", aksi="BELI", kode=r["Kode"], lot=lot, harga=harga, nilai=nilai,
+                         tp="exit sinyal", sl=f"CL {rp(llock_map.get(r['Kode'], 0))}",
+                         alasan=f"Compounding conf {r['Buy Conf']:.0f}, beli sebelum close"))
+
+# ----------------------------------------------------------------- Harmonic: antrian OBERLIN
+hb_orders = []       # antrian yang disarankan
+kurang_besar = 0.0   # kekurangan kas untuk sinyal Besar SAH
+kas_ob_sisa = kas_ob
+butuh_pindah = []    # sinyal Besar yang menunggu pindah kas
+lewati_m = []        # sinyal Menengah SAH yang dilewati karena jatah 20% penuh
+if not hb_df.empty:
+    sig = hb_df[hb_df["Status Order"] == "SAH"].copy()
+    sig["_sk"] = (sig["Skala"] != "Besar").astype(int)
+    sig = sig.sort_values(["_sk", "Jarak PRZ %"])
+    for _, r in sig.iterrows():
+        if r["Kode"] in dipegang:
+            continue
+        asal = "harmonic_besar" if r["Skala"] == "Besar" else "harmonic_menengah"
+        legs = ([("gabung", r["Antri Atas"], 2 * alok_hb)] if r["Antri Atas"] == r["Antri Bawah"]
+                else [("atas", r["Antri Atas"], alok_hb), ("bawah", r["Antri Bawah"], alok_hb)])
+        legs = [(b, h_, dn, lot_hb(dn, h_)) for b, h_, dn in legs]
+        if any(x[3] <= 0 for x in legs):
+            continue
+        butuh = sum(x[3] * x[1] * 100 * (1 + FEE_BELI) for x in legs)
+        if asal == "harmonic_menengah" and eksp_m + butuh > cap_m + 1:
+            lewati_m.append(r["Kode"])
+            continue
+        item = dict(kode=r["Kode"], asal=asal, legs=legs, butuh=butuh, tp1=r["TP1"], stop=r["Stop (close)"],
+                    harga_c=r["Harga C"], pola=r["Pola"], skala=r["Skala"])
+        if butuh <= kas_ob_sisa:
+            kas_ob_sisa -= butuh
+            if asal == "harmonic_menengah":
+                eksp_m += butuh
+            hb_orders.append(item)
+        elif asal == "harmonic_besar" and mm["mode"] == "PANIK":
+            item["kurang"] = butuh - max(kas_ob_sisa, 0.0)
+            item["pakai_kas_ob"] = max(kas_ob_sisa, 0.0)
+            kas_ob_sisa = 0.0
+            butuh_pindah.append(item)
+        else:
+            aksi.append(dict(urut=7, akun="OBERLIN", aksi="TERLEWAT (KAS)", kode=r["Kode"], lot=None, harga=None,
+                             nilai=butuh, tp="", sl="", alasan=f"{r['Skala']} {r['Pola']}, kas OBERLIN kurang"))
+
+if lewati_m:
+    aksi.append(dict(urut=7, akun="OBERLIN", aksi="LEWATI", kode=", ".join(lewati_m), lot=None, harga=None,
+                     nilai=None, tp="", sl="",
+                     alasan=f"{len(lewati_m)} sinyal Menengah SAH: jatah penuh ({rp(eksp_m)} dari batas {rp(cap_m)})"))
+idle_tk = max(kas_tk_sisa, 0.0)
+saran_pindah = 0.0
+pool = idle_tk
+for item in butuh_pindah:
+    # sinyal Besar diproses sesuai prioritas; hanya yang kekurangannya tertutup penuh yang dibuatkan order
+    if item["kurang"] <= pool + 1:
+        pool -= item["kurang"]
+        saran_pindah += item["kurang"]
+        kurang_besar += item["kurang"]
+        hb_orders.append(dict(item, setelah_pindah=True))
+    else:
+        kurang_besar += item["kurang"]
+        aksi.append(dict(urut=7, akun="OBERLIN", aksi="TERLEWAT (KAS)", kode=item["kode"], lot=None, harga=None,
+                         nilai=item["butuh"], tp="", sl="",
+                         alasan=f"kurang {rp(item['kurang'])}, kas TEKNIKAL menganggur tinggal {rp(pool)}"))
+if saran_pindah > 0:
+    aksi.append(dict(urut=4, akun="TEKNIKAL→OBERLIN", aksi="PINDAH KAS", kode="-", lot=None, harga=None,
+                     nilai=saran_pindah, tp="", sl="",
+                     alasan="mode PANIK: harmonic Besar didahulukan, kas TEKNIKAL menganggur"))
+for item in hb_orders:
+    for bag, harga, dana, lot in item["legs"]:
+        aksi.append(dict(urut=6, akun="OBERLIN", aksi="ANTRI BELI", kode=item["kode"], lot=lot, harga=harga,
+                         nilai=lot * harga * 100, tp=rp(item["tp1"]), sl=f"{rp(item['stop'])} (close)",
+                         alasan=f"{item['skala']} {item['pola']} · PRZ {bag}"
+                                + (" · setelah pindah kas" if item.get("setelah_pindah") else "")))
+
+aksi_df = pd.DataFrame(aksi)
+if not aksi_df.empty:
+    aksi_df = aksi_df.sort_values(["urut", "akun", "kode"]).reset_index(drop=True)
+
+
+def build_state_json():
+    p = pos_df.copy()
+    for i, e in pos_eval.items():
+        p.at[i, "ob_streak"] = float(e["ob"])
+        p.at[i, "ob_tgl"] = e["ob_tgl"]
+    return json.dumps({
+        "versi": 2, "disimpan": now.strftime("%Y-%m-%d %H:%M"),
+        "kas": {"OBERLIN": kas_ob, "TEKNIKAL": kas_tk}, "modal_masuk_teknikal": modal_masuk,
+        "posisi": clean_records(p), "antrian": clean_records(q_df),
+    }, indent=2, ensure_ascii=False)
+
+
+# ----------------------------------------------------------------- RINGKASAN
+with tab_ring:
+    gb = mm["gate_baru"]
+    aturan = {"PANIK": "Harmonic Besar didahulukan, kas TEKNIKAL menganggur boleh dipindah.",
+              "NORMAL": "Compounding penuh, harmonic dari kas OBERLIN.",
               "EUFORIA": "Stop beli Compounding baru."}[mm["mode"]]
     st.markdown(cards([
         ("MODE PASAR", mm["mode"], MODE_COL[mm["mode"]], aturan),
         ("IHSG 20 HARI BURSA", f"{mm['ret20']:+.1f}%", MODE_COL[mm["mode"]],
-         f"PANIK ≤ {PANIK_RET20*100:.0f}% · EUFORIA > +{EUFORIA_RET20*100:.0f}%"),
-        ("IHSG", rp(mm["close"]), COL["text"], f"{mm['dd_peak']:+.1f}% dari puncak 1 tahun"),
-        ("GERBANG BEAR (PERBAIKAN)", gb["regime"], COL["red"] if gb["regime"] == "BEAR" else COL["green"],
-         (f"dasar {rp(gb['trough'])} ({gb['trough_date'].strftime('%d %b %y')}), "
-          f"{gb['pct_trough']:+.1f}% dari dasar · butuh +20%") if gb["in_ep"] else "tidak dalam episode bear"),
+         f"IHSG {rp(mm['close'])} · {mm['dd_peak']:+.1f}% dari puncak 1 th"),
+        ("GERBANG BEAR", gb["regime"], COL["red"] if gb["regime"] == "BEAR" else COL["green"],
+         (f"dasar {rp(gb['trough'])}, {gb['pct_trough']:+.1f}% · ambang conf {amb_baru}")
+         if gb["in_ep"] else "tidak dalam episode bear"),
+        ("DASAR PORSI HARMONIC", rp(basis_hb), COL["violet"], f"10% = {rp(alok_hb)} per antrian"),
     ]), unsafe_allow_html=True)
-    if gl["regime"] != gb["regime"]:
-        st.markdown(f'<div class="mg-warn">Gerbang versi lama (Compounding Terminal) masih <b>{gl["regime"]}</b>, '
-                    f'versi perbaikan <b>{gb["regime"]}</b>. Selisihnya: saat BEAR, kandidat Compounding '
-                    f'hanya diambil kalau Buy Confidence ≥ {AMBANG_CONF_BEAR}.</div>', unsafe_allow_html=True)
-    ser = ihsg.tail(250).rename("IHSG")
-    st.line_chart(ser, height=260)
-    r20 = (ihsg / ihsg.shift(20) - 1).tail(250) * 100
-    st.caption("Perubahan IHSG 20 hari bursa (%). Garis di bawah -5 = PANIK, di atas +10 = EUFORIA.")
-    st.line_chart(pd.DataFrame({"IHSG 20H %": r20, "Batas PANIK": -5.0, "Batas EUFORIA": 10.0}), height=200)
+    st.markdown(cards([
+        ("EKUITAS OBERLIN", rp(ekuitas["OBERLIN"]), COL["text"],
+         f"kas {rp(kas_ob)} · saham {rp(mv['OBERLIN'])} · antri {rp(dana_antri['OBERLIN'])}"),
+        ("EKUITAS TEKNIKAL", rp(ekuitas["TEKNIKAL"]), COL["text"],
+         f"kas {rp(kas_tk)} · saham {rp(mv['TEKNIKAL'])}"),
+        ("MENENGAH (OBERLIN)", f"{(eksp_m / ekuitas['OBERLIN'] * 100) if ekuitas['OBERLIN'] > 0 else 0:.0f}%",
+         COL["red"] if eksp_m > cap_m else COL["green"], f"{rp(eksp_m)} dari batas {rp(cap_m)}"),
+        ("AKSI HARI INI", len(aksi_df), COL["amber"], "lihat tab AKSI HARI INI"),
+    ]), unsafe_allow_html=True)
+    if saran_pindah > 0:
+        st.markdown(f'<div class="mg-move">⇄ <b>PINDAH KAS Rp {rp(saran_pindah)}</b> dari TEKNIKAL ke OBERLIN. '
+                    f'Kekurangan sinyal Besar {rp(kurang_besar)}, kas TEKNIKAL menganggur {rp(idle_tk)}. '
+                    'Pindahkan manual di Stockbit, lalu perbarui angka kas di tab STATE.</div>',
+                    unsafe_allow_html=True)
+    if pos_df.empty and q_df.empty and kas_ob == 0 and kas_tk == 0:
+        st.markdown('<div class="mg-warn">State masih kosong. Muat file state atau impor portfolio.json '
+                    'di tab STATE & JURNAL, lalu isi kas kedua akun.</div>', unsafe_allow_html=True)
+    st.line_chart(ihsg.tail(250).rename("IHSG"), height=220)
+
+# ----------------------------------------------------------------- AKSI
+with tab_aksi:
+    if aksi_df.empty:
+        st.info("Tidak ada aksi hari ini.")
+    else:
+        st.dataframe(aksi_df.drop(columns="urut"), hide_index=True, width="stretch",
+                     height=min(640, 38 + 35 * len(aksi_df)),
+                     column_config={"lot": st.column_config.NumberColumn(format="%d"),
+                                    "harga": st.column_config.NumberColumn(format="%.0f"),
+                                    "nilai": st.column_config.NumberColumn(format="%.0f")})
+    st.caption("Urutan: jual/cek dulu → ubah order & antrian → pindah kas → beli Compounding → antri harmonic. "
+               "Harga antri sudah sesuai fraksi BEI. Harmonic: jual semua di TP1, stop basis close harian.")
+
+    st.markdown("**Catat ke state setelah dieksekusi di Stockbit**")
+    tgl_today = now.strftime("%Y-%m-%d")
+    opsi_hb = [f"{it['kode']} {bag} {lot} lot @{rp(h_)}" for it in hb_orders for bag, h_, _, lot in it["legs"]]
+    pilih_hb = st.multiselect("Antrian harmonic yang sudah dipasang", opsi_hb)
+    if st.button("➕ Catat antrian terpasang") and pilih_hb:
+        add = []
+        for it in hb_orders:
+            for bag, h_, _, lot in it["legs"]:
+                if f"{it['kode']} {bag} {lot} lot @{rp(h_)}" in pilih_hb:
+                    add.append(dict(akun="OBERLIN", kode=it["kode"], asal=it["asal"], bagian=bag, harga=h_, lot=lot,
+                                    tanggal_pasang=tgl_today, tp1=it["tp1"], stop=it["stop"],
+                                    harga_c=it["harga_c"], catatan=f"{it['skala']} {it['pola']}"))
+        ss["pos_base"] = pos_df
+        ss["q_base"] = to_frame(clean_records(q_df) + add, Q_COLS, NUM_Q)
+        ss["ver"] += 1
+        st.rerun()
+    opsi_ct = [f"{o['kode']} {o['lot']} lot @{rp(o['harga'])}" for o in ct_orders]
+    pilih_ct = st.multiselect("Beli Compounding yang sudah terisi (ubah lot/avg di tabel posisi kalau beda)", opsi_ct)
+    if st.button("➕ Catat beli Compounding") and pilih_ct:
+        add = [dict(akun="TEKNIKAL", kode=o["kode"], asal="compounding", lot=o["lot"], avg=o["harga"],
+                    tanggal_beli=stock_last.strftime("%Y-%m-%d"), ll20=o["llock"], ob_streak=0, ob_tgl="",
+                    tp1=None, stop=None, harga_c=None, order_tp="", order_sl="", catatan="")
+               for o in ct_orders if f"{o['kode']} {o['lot']} lot @{rp(o['harga'])}" in pilih_ct]
+        ss["pos_base"] = to_frame(clean_records(pos_df) + add, POS_COLS, NUM_POS)
+        ss["q_base"] = q_df
+        ss["ver"] += 1
+        st.rerun()
+    terisi = {i: r for i, r in q_df.iterrows() if q_eval.get(i) and q_eval[i][0] == "TERISI?"}
+    opsi_fill = [f"{r['kode']} {r['bagian']} {int(num(r['lot']))} lot @{rp(num(r['harga']))}" for r in terisi.values()]
+    pilih_fill = st.multiselect("Antrian yang sudah terisi → pindah ke posisi", opsi_fill)
+    if st.button("➕ Pindahkan ke posisi") and pilih_fill:
+        add, drop = [], []
+        for i, r in terisi.items():
+            if f"{r['kode']} {r['bagian']} {int(num(r['lot']))} lot @{rp(num(r['harga']))}" in pilih_fill:
+                drop.append(i)
+                add.append(dict(akun=r["akun"], kode=r["kode"], asal=r["asal"], lot=r["lot"], avg=r["harga"],
+                                tanggal_beli=q_eval[i][1].strftime("%Y-%m-%d"), ll20=None, ob_streak=0, ob_tgl="",
+                                tp1=r["tp1"], stop=r["stop"], harga_c=r["harga_c"], order_tp="", order_sl="",
+                                catatan=f"antrian {r['bagian']} terisi"))
+        ss["pos_base"] = to_frame(clean_records(pos_df) + add, POS_COLS, NUM_POS)
+        ss["q_base"] = q_df.drop(index=drop).reset_index(drop=True)
+        ss["ver"] += 1
+        st.rerun()
+
+    st.markdown("**Ringkasan jurnal (salin ke excel jurnal)**")
+    lines = []
+    for _, a in (aksi_df.iterrows() if not aksi_df.empty else []):
+        if a["aksi"] in ("BELI", "ANTRI BELI", "JUAL", "PINDAH KAS"):
+            lot_txt = f"{int(a['lot'])} lot" if pd.notna(a["lot"]) else ""
+            hg = f"@{rp(a['harga'])}" if pd.notna(a["harga"]) else ""
+            nil = f"Rp{rp(a['nilai'])}" if pd.notna(a["nilai"]) else ""
+            lines.append(" | ".join(x for x in [tgl_today, a["akun"], a["aksi"], a["kode"], f"{lot_txt} {hg}".strip(),
+                                                nil, f"TP {a['tp']}" if a["tp"] else "",
+                                                f"SL {a['sl']}" if a["sl"] else "", a["alasan"]] if x))
+    for _, r in pos_df[pos_df["asal"] == "deviasi"].iterrows():
+        lines.append(f"{tgl_today} | {r['akun']} | DEVIASI (dipegang) | {r['kode']} | {int(num(r['lot']))} lot "
+                     f"@{num(r['avg']):,.2f} | dipisahkan dari kinerja sistem")
+    st.text_area("Rencana transaksi hari ini", "\n".join(lines) or "-", height=180)
+
+# ----------------------------------------------------------------- STATE: unduh
+with tab_state:
+    st.download_button("⬇ Unduh state JSON (simpan di akhir sesi)", data=build_state_json(),
+                       file_name=f"state_gabungan_{now.strftime('%Y-%m-%d')}.json", mime="application/json")
+    if pos_eval:
+        st.caption("ob_streak dan ob_tgl posisi Compounding di file unduhan sudah diperbarui sampai candle "
+                   f"{stock_last.strftime('%d %b %Y')}.")
+        st.dataframe(pd.DataFrame([dict(kode=pos_df.at[i, "kode"], K=e["k"], ob_streak=e["ob"], ob_tgl=e["ob_tgl"],
+                                         sinyal=e["trig"][0] if e["trig"] else "HOLD")
+                                   for i, e in pos_eval.items()]),
+                     hide_index=True, width="stretch",
+                     column_config={"K": st.column_config.NumberColumn(format="%.1f")})
 
 # ----------------------------------------------------------------- HARMONIC
 with tab_hb:
     if hb_df.empty:
         st.info("Belum ada sinyal harmonic bullish skala Besar/Menengah yang lolos syarat.")
     else:
-        v = hb_df.copy()
-        v["Min hari ke PRZ"] = [min_hari_ke_prz(h_, t_, arb) for h_, t_ in zip(v["Harga"], v["Antri Atas"])]
-        v["_sk"] = (v["Skala"] != "Besar").astype(int)
-        v["_kt"] = (v["Kategori"] != "SINYAL").astype(int)
-        v = v.sort_values(["_sk", "_kt", "Jarak PRZ %"]).drop(columns=["_sk", "_kt"]).reset_index(drop=True)
-        nb = int(((v["Skala"] == "Besar") & (v["Kategori"] == "SINYAL")).sum())
-        nm = int(((v["Skala"] == "Menengah") & (v["Kategori"] == "SINYAL")).sum())
-        npr = int((v["Kategori"] != "SINYAL").sum())
-        nlb = int((v["PRZ lebar"] != "").sum())
+        vv = hb_df.copy()
+        vv["Min hari ke PRZ"] = [min_hari_ke_prz(h_, t_, arb) for h_, t_ in zip(vv["Harga"], vv["Antri Atas"])]
+        vv["Dipegang/antri"] = vv["Kode"].isin(dipegang).map({True: "ya", False: ""})
+        vv["_sk"] = (vv["Skala"] != "Besar").astype(int)
+        vv["_so"] = (vv["Status Order"] != "SAH").astype(int)
+        vv = vv.sort_values(["_sk", "_so", "Jarak PRZ %"]).drop(columns=["_sk", "_so"]).reset_index(drop=True)
         st.markdown(cards([
-            ("SINYAL BESAR", nb, COL["cyan"], "jarak ≤15% hari ini"),
-            ("SINYAL MENENGAH", nm, COL["violet"], "maks 20% porto (diatur di tahap 2)"),
-            ("PERNAH ≤15%", npr, COL["amber"], "sempat aktif sejak C, kini menjauh"),
-            ("PRZ LEBAR", nlb, COL["red"], f"risiko dari antri atas > {HB_LEBAR_X:g}× potensi"),
+            ("SAH BESAR", int(((vv["Skala"] == "Besar") & (vv["Status Order"] == "SAH")).sum()), COL["cyan"],
+             "dibuatkan order"),
+            ("SAH MENENGAH", int(((vv["Skala"] == "Menengah") & (vv["Status Order"] == "SAH")).sum()), COL["violet"],
+             "kalau jatah 20% masih ada"),
+            ("TUA", int((vv["Status Order"] == "TUA").sum()), COL["amber"],
+             f"PRZ disentuh > {HB_SENTUH_MAX} hari bursa lalu"),
+            ("PRZ LEBAR", int((vv["PRZ lebar"] != "").sum()), COL["red"], f"risiko > {HB_LEBAR_X:g}× potensi"),
         ]), unsafe_allow_html=True)
-        pilih = st.multiselect("Skala", ["Besar", "Menengah"], default=["Besar", "Menengah"])
-        v = v[v["Skala"].isin(pilih)]
         num0 = st.column_config.NumberColumn(format="%.0f")
         num1 = st.column_config.NumberColumn(format="%.1f")
-        num2 = st.column_config.NumberColumn(format="%.2f")
         st.dataframe(
-            v, hide_index=True, width="stretch", height=min(640, 38 + 35 * max(len(v), 1)),
-            column_order=["Kode", "Skala", "Pola", "Status", "Kategori", "PRZ lebar", "Harga",
-                          "Jarak PRZ %", "Min hari ke PRZ", "Antri Atas", "Antri Bawah", "Stop (close)",
-                          "TP1", "Risiko dari atas %", "Potensi TP1 dari atas %", "R:R Rencana",
-                          "Sentuh PRZ (hari lalu)", "Aktif sejak", "Hari aktif", "Waktu", "Tanggal C",
-                          "Umur C", "TP2", "Value Min 20H (M)"],
+            vv, hide_index=True, width="stretch", height=min(640, 38 + 35 * max(len(vv), 1)),
+            column_order=["Kode", "Skala", "Pola", "Status Order", "Dipegang/antri", "Status", "Kategori",
+                          "PRZ lebar", "Harga", "Jarak PRZ %", "Min hari ke PRZ", "Antri Atas", "Antri Bawah",
+                          "Stop (close)", "TP1", "Harga C", "Risiko dari atas %", "Potensi TP1 dari atas %",
+                          "R:R Rencana", "Sentuh PRZ (hari lalu)", "Aktif sejak", "Umur sinyal (hari)",
+                          "Waktu", "Tanggal C", "Umur C", "Value Min 20H (M)"],
             column_config={"Harga": num0, "Antri Atas": num0, "Antri Bawah": num0, "Stop (close)": num0,
-                           "TP1": num0, "TP2": num0, "Jarak PRZ %": num1, "Risiko dari atas %": num1,
-                           "Potensi TP1 dari atas %": num1, "R:R Rencana": num2,
-                           "Value Min 20H (M)": num1},
-        )
-        st.caption("Semua pola bullish. Harga antri sudah sesuai fraksi BEI. Stop dihitung dari close harian. "
-                   "Aturan keluar: jual semua di TP1. 'Sentuh PRZ' = berapa hari lalu low pertama kali masuk PRZ; "
-                   "makin besar angkanya, pola makin tua. 'PRZ lebar' = kalau antri di batas atas, risiko ke stop "
-                   "lebih dari 2× potensi ke TP1 (kasus DSSA): sebaiknya hanya antri di batas bawah atau dilewati.")
+                           "TP1": num0, "Harga C": num0, "Jarak PRZ %": num1, "Risiko dari atas %": num1,
+                           "Potensi TP1 dari atas %": num1,
+                           "R:R Rencana": st.column_config.NumberColumn(format="%.2f"),
+                           "Value Min 20H (M)": num1})
+        st.caption("SAH = pernah masuk jarak ≤15% sejak C, belum tembus C, umur ≤220 hari, PRZ belum disentuh "
+                   f"atau baru disentuh ≤{HB_SENTUH_MAX} hari bursa lalu. TUA = tetap tampil, tanpa order.")
     if hb_gagal:
         st.caption(f"{hb_gagal} perhitungan gagal dan dilewati.")
 
 # ----------------------------------------------------------------- COMPOUNDING
 with tab_ct:
-    ctdf, amb_lama, amb_baru = ct_table(ct_rows, mm)
+    if sesi == "SESI SORE":
+        st.markdown('<div class="mg-warn">Sesi sore: candle sudah final, pasar sudah tutup. Sinyal Compounding '
+                    'dieksekusi di sesi 15.00–16.15 (beli sebelum close). Daftar ini untuk cek saja.</div>',
+                    unsafe_allow_html=True)
     if ctdf.empty:
-        st.info("Tidak ada kandidat breakout yang lolos gerbang Compounding hari ini.")
+        st.info("Tidak ada kandidat breakout yang lolos gerbang Compounding.")
     else:
-        nbeli = int((ctdf["Status"] == "BELI").sum())
         st.markdown(cards([
             ("LOLOS SCREENER", len(ctdf), COL["text"], "semua gerbang kode asli"),
-            ("SIAP BELI", nbeli, COL["green"], "urut Buy Confidence"),
-            ("DICORET / DITAHAN", len(ctdf) - nbeli, COL["red"], "red-flag, ARA, ambang BEAR, euforia"),
+            ("ORDER BELI", len(ct_orders), COL["green"], f"20% modal = {rp(alok_ct)}"),
+            ("DICORET / DITAHAN", int((ctdf["Status"] != "BELI").sum()), COL["red"],
+             "red-flag, ARA, ambang BEAR, euforia"),
             ("AMBANG CONF", f"{amb_baru}", COL["amber"], f"versi lama: {amb_lama}"),
         ]), unsafe_allow_html=True)
-        num0 = st.column_config.NumberColumn(format="%.0f")
-        num1 = st.column_config.NumberColumn(format="%.1f")
-        num2 = st.column_config.NumberColumn(format="%.2f")
-        st.dataframe(ctdf, hide_index=True, width="stretch",
-                     height=min(640, 38 + 35 * max(len(ctdf), 1)),
-                     column_config={"Buy Conf": num0, "Close": num0, "CL (LL20)": num0, "HH20": num0,
-                                    "Naik hari ini %": num1, "K": num1, "Vol Ratio": num2,
-                                    "Value MA20 (M)": num1})
-        st.caption("Beli di close hari breakout, porsi 20% modal per posisi (sizing di tahap 2). "
-                   "Exit: close < CL (LL20 dikunci saat beli), atau K>80 dua hari beruntun, atau K>80 sehari "
-                   "dan low ≤ harga beli (tidak berlaku di hari beli). Saham yang sudah dipegang belum dicoret "
-                   "di tahap ini.")
-
-# ----------------------------------------------------------------- UJI KECOCOKAN
-with tab_uji:
-    st.markdown("**Cara uji (sore, setelah 16.15 WIB, di hari yang sama):**")
-    st.markdown(
-        "1. **Harmonic Board lama**, setelan: skala *Besar (5×ATR)*, umur C 150, basis stop *Close harian*, "
-        "buffer 0, arah *Bullish*, status *Di PRZ + Menuju PRZ*, posisi semua, tembus 50, "
-        "**R:R minimum 0,5**, jarak maks 15%, value 1. Ulangi untuk skala *Menengah (3×ATR)*, umur C 80.\n"
-        "2. **Compounding Terminal lama**: tekan *Pindai Pasar*.\n"
-        "3. Bandingkan dengan daftar di bawah. Selisih yang **disengaja**: kategori *PERNAH ≤15%* "
-        "(tidak ada di app lama), red-flag dan ARA (app lama tetap menampilkan), ambang BEAR versi perbaikan, "
-        "dan saham yang sudah dipegang (app lama menyembunyikannya).")
-    if not hb_df.empty:
-        for sk in ("Besar", "Menengah"):
-            x = hb_df[(hb_df["Skala"] == sk) & (hb_df["Kategori"] == "SINYAL")]
-            kode = ", ".join(sorted(f"{a} ({b})" for a, b in zip(x["Kode"], x["Pola"]))) or "-"
-            st.markdown(f"**Harmonic {sk}: {len(x)} pola** → {kode}")
-    else:
-        st.markdown("**Harmonic:** tidak ada sinyal.")
-    if ct_rows:
-        ctdf, amb_lama, _ = ct_table(ct_rows, mm)
-        lama = ctdf[ctdf["Tampil di app lama"] == "Ya"]
-        st.markdown(f"**Compounding (versi app lama, ambang {amb_lama}): {len(lama)} kandidat** → "
-                    + (", ".join(lama.sort_values("Buy Conf", ascending=False)
-                                 .apply(lambda r: f"{r['Kode']} {r['Buy Conf']:.0f}%", axis=1)) or "-"))
-    else:
-        st.markdown("**Compounding:** tidak ada kandidat.")
-    st.caption("Catatan teknis: data Harmonic dibentuk persis seperti app lama (buang baris volume nol, "
-               "riwayat 2 tahun). Compounding memakai data yang sama tanpa membuang baris volume nol, "
-               "seperti app lama. Kalau ada selisih di luar daftar 'disengaja', kirim screenshot kedua app.")
+        st.dataframe(ctdf, hide_index=True, width="stretch", height=min(640, 38 + 35 * max(len(ctdf), 1)),
+                     column_config={"Buy Conf": st.column_config.NumberColumn(format="%.0f"),
+                                    "Close": st.column_config.NumberColumn(format="%.0f"),
+                                    "CL (LL20)": st.column_config.NumberColumn(format="%.0f"),
+                                    "HH20": st.column_config.NumberColumn(format="%.0f"),
+                                    "Naik hari ini %": st.column_config.NumberColumn(format="%.1f"),
+                                    "K": st.column_config.NumberColumn(format="%.1f"),
+                                    "Vol Ratio": st.column_config.NumberColumn(format="%.2f"),
+                                    "Value MA20 (M)": st.column_config.NumberColumn(format="%.1f")})
+        for kode, why in ct_info:
+            st.caption(f"{kode}: {why}")
