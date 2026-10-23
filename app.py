@@ -1133,10 +1133,13 @@ def find_pattern(d, skala, pola, tgl_c):
 AKUN = ["OBERLIN", "TEKNIKAL"]
 ASAL = ["compounding", "harmonic_besar", "harmonic_menengah", "warisan", "deviasi"]
 POS_COLS = ["akun", "kode", "asal", "lot", "avg", "tanggal_beli", "ll20", "ob_streak", "ob_tgl",
-            "tp1", "stop", "harga_c", "order_tp", "order_sl", "catatan"]
+            "tp1", "stop", "harga_c", "order_tp", "order_sl", "catatan", "harga_nol"]
 Q_COLS = ["akun", "kode", "asal", "bagian", "harga", "lot", "tanggal_pasang", "tp1", "stop",
           "harga_c", "catatan"]
-NUM_POS = ["lot", "avg", "ll20", "ob_streak", "tp1", "stop", "harga_c"]
+NUM_POS = ["lot", "avg", "ll20", "ob_streak", "tp1", "stop", "harga_c", "harga_nol"]
+KELOMPOK = {"compounding": "Compounding", "harmonic_besar": "Harmonic Besar",
+            "harmonic_menengah": "Harmonic Menengah", "deviasi": "Deviasi (insting)", "warisan": "Warisan"}
+SISTEM = ["Compounding", "Harmonic Besar", "Harmonic Menengah"]
 NUM_Q = ["harga", "lot", "tp1", "stop", "harga_c"]
 
 
@@ -1388,7 +1391,7 @@ div.stButton > button:hover {{ background:{COL['green']}; color:#000; }}
 st.markdown("""
 <div class="mg-head">
   <div class="mg-title">◆ MESIN GABUNGAN</div>
-  <div class="mg-sub">TAHAP 2 // MODE PASAR · ALOKASI KAS · DAFTAR ORDER · STATE JSON</div>
+  <div class="mg-sub">MODE PASAR · ORDER · KINERJA</div>
 </div>""", unsafe_allow_html=True)
 
 if yf is None:
@@ -1416,6 +1419,9 @@ ss.setdefault("q_base", to_frame([], Q_COLS, NUM_Q))
 ss.setdefault("meta", {"kas_OBERLIN": 0.0, "kas_TEKNIKAL": 0.0, "kas_settle": 0.0, "modal_masuk": 0.0})
 ss.setdefault("_up_sig", None)
 ss.setdefault("_ct_sig", None)
+ss.setdefault("log", [])        # transaksi tertutup + setoran/penarikan
+ss.setdefault("eq_hist", [])    # ekuitas harian (data final)
+ss.setdefault("nol", None)      # titik nol kinerja
 
 # State otomatis: kalau sesi baru dan ada file state_gabungan.json di repo, langsung dimuat.
 STATE_REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state_gabungan.json")
@@ -1434,6 +1440,9 @@ if not ss.get("_auto_loaded"):
                           "kas_settle": float(js0.get("kas_settle_teknikal", kas0.get("TEKNIKAL", 0)) or 0),
                           "modal_masuk": float(js0.get("modal_masuk_teknikal", 0) or 0)}
             ss["_auto_src"] = js0.get("disimpan", "?")
+            ss["log"] = list(js0.get("log_transaksi", []))
+            ss["eq_hist"] = list(js0.get("ekuitas_harian", []))
+            ss["nol"] = js0.get("titik_nol")
             ss["ver"] += 1
         except Exception:
             ss["_auto_src"] = "GAGAL"
@@ -1487,8 +1496,8 @@ if ihsg_telat:
                 'Kalau IHSG sedang dekat batas -5% / +10%, cek angka IHSG manual sebelum memutuskan.</div>',
                 unsafe_allow_html=True)
 
-tab_ring, tab_aksi, tab_state, tab_hb, tab_ct = st.tabs(
-    ["RINGKAS", "AKSI", "STATE", "HARMONIC", "COMPOUND"])
+tab_ring, tab_aksi, tab_kin, tab_state, tab_hb, tab_ct = st.tabs(
+    ["RINGKAS", "AKSI", "KINERJA", "STATE", "HARMONIC", "COMPOUND"])
 
 # ----------------------------------------------------------------- STATE (dibaca lebih dulu)
 with tab_state:
@@ -1510,6 +1519,9 @@ with tab_state:
                           "kas_TEKNIKAL": float(kas.get("TEKNIKAL", 0) or 0),
                           "kas_settle": float(js.get("kas_settle_teknikal", kas.get("TEKNIKAL", 0)) or 0),
                           "modal_masuk": float(js.get("modal_masuk_teknikal", 0) or 0)}
+            ss["log"] = list(js.get("log_transaksi", []))
+            ss["eq_hist"] = list(js.get("ekuitas_harian", []))
+            ss["nol"] = js.get("titik_nol")
             ss["_up_sig"] = (up.name, up.size)
             ss["ver"] += 1
             st.rerun()
@@ -1702,6 +1714,23 @@ for i, r in q_df.iterrows():
         dana_antri[r["akun"]] += dana
 
 ekuitas = {a: (kas_ob if a == "OBERLIN" else kas_tk) + mv.get(a, 0.0) + dana_antri.get(a, 0.0) for a in AKUN}
+
+# ---- catatan ekuitas harian: hanya saat candle sudah final (di luar 09.00–16.15 hari bursa) ----
+_hm = (now.hour, now.minute)
+data_final = now.weekday() >= 5 or _hm >= (16, 15) or _hm < (9, 0) or stock_last.date() < now.date()
+if data_final and not (pos_df.empty and kas_ob == 0 and kas_tk == 0):
+    _tgl = stock_last.strftime("%Y-%m-%d")
+    _ih = float(ihsg.loc[:stock_last].iloc[-1])
+    _row = {"tanggal": _tgl, "OBERLIN": round(ekuitas["OBERLIN"]), "TEKNIKAL": round(ekuitas["TEKNIKAL"]),
+            "IHSG": round(_ih, 2)}
+    ss["eq_hist"] = [x for x in ss["eq_hist"] if x.get("tanggal") != _tgl] + [_row]
+    ss["eq_hist"].sort(key=lambda x: x["tanggal"])
+    if not ss.get("nol"):
+        ss["nol"] = dict(_row)
+    elif not ss["nol"].get("IHSG"):
+        _m = [x for x in ss["eq_hist"] if x["tanggal"] == ss["nol"]["tanggal"]]
+        if _m:
+            ss["nol"]["IHSG"] = _m[0]["IHSG"]
 basis_hb = ekuitas["OBERLIN"] + (ekuitas["TEKNIKAL"] if basis_opt.startswith("Ekuitas OBERLIN +") else 0.0)
 alok_hb = HB_PORSI * basis_hb
 dipegang = set(pos_df["kode"]) | set(q_df["kode"])
@@ -1875,6 +1904,8 @@ def build_state_json():
         "kas": {"OBERLIN": kas_ob, "TEKNIKAL": kas_tk}, "kas_settle_teknikal": kas_settle,
         "modal_masuk_teknikal": modal_masuk,
         "posisi": clean_records(p), "antrian": clean_records(q_df),
+        "titik_nol": ss.get("nol"), "ekuitas_harian": ss.get("eq_hist", []),
+        "log_transaksi": ss.get("log", []),
     }, indent=2, ensure_ascii=False)
 
 
@@ -2033,6 +2064,8 @@ with tab_aksi:
                                     harga_c=it["harga_c"], catatan=f"{it['skala']} {it['pola']}"))
         ss["pos_base"] = pos_df
         ss["q_base"] = to_frame(clean_records(q_df) + add, Q_COLS, NUM_Q)
+        ss["meta"]["kas_OBERLIN"] = max(0.0, ss["meta"]["kas_OBERLIN"] - sum(
+            a_["harga"] * a_["lot"] * 100 * (1 + FEE_BELI) for a_ in add))
         ss["ver"] += 1
         st.rerun()
     opsi_ct = [f"{o['kode']} {o['lot']} lot @{rp(o['harga'])}" for o in ct_orders]
@@ -2044,6 +2077,9 @@ with tab_aksi:
                for o in ct_orders if f"{o['kode']} {o['lot']} lot @{rp(o['harga'])}" in pilih_ct]
         ss["pos_base"] = to_frame(clean_records(pos_df) + add, POS_COLS, NUM_POS)
         ss["q_base"] = q_df
+        _c = sum(a_["avg"] * a_["lot"] * 100 * (1 + FEE_BELI) for a_ in add)
+        ss["meta"]["kas_TEKNIKAL"] = max(0.0, ss["meta"]["kas_TEKNIKAL"] - _c)
+        ss["meta"]["kas_settle"] = max(0.0, ss["meta"].get("kas_settle", 0.0) - _c)
         ss["ver"] += 1
         st.rerun()
     terisi = {i: r for i, r in q_df.iterrows() if q_eval.get(i) and q_eval[i][0] == "TERISI?"}
@@ -2052,164 +2088,4 @@ with tab_aksi:
     if st.button("➕ Pindahkan ke posisi") and pilih_fill:
         add, drop = [], []
         for i, r in terisi.items():
-            if f"{r['kode']} {r['bagian']} {int(num(r['lot']))} lot @{rp(num(r['harga']))}" in pilih_fill:
-                drop.append(i)
-                add.append(dict(akun=r["akun"], kode=r["kode"], asal=r["asal"], lot=r["lot"], avg=r["harga"],
-                                tanggal_beli=q_eval[i][1].strftime("%Y-%m-%d"), ll20=None, ob_streak=0, ob_tgl="",
-                                tp1=r["tp1"], stop=r["stop"], harga_c=r["harga_c"], order_tp="", order_sl="",
-                                catatan=f"antrian {r['bagian']} terisi"))
-        ss["pos_base"] = to_frame(clean_records(pos_df) + add, POS_COLS, NUM_POS)
-        ss["q_base"] = q_df.drop(index=drop).reset_index(drop=True)
-        ss["ver"] += 1
-        st.rerun()
-
-    st.markdown("**Ringkasan jurnal (salin ke excel jurnal)**")
-    lines = []
-    for _, a in (aksi_df.iterrows() if not aksi_df.empty else []):
-        if a["aksi"] in ("BELI", "ANTRI BELI", "JUAL", "PINDAH KAS", "PINDAH KAS T+2", "PINDAH SAHAM"):
-            lot_txt = f"{int(a['lot'])} lot" if pd.notna(a["lot"]) else ""
-            hg = f"@{rp(a['harga'])}" if pd.notna(a["harga"]) else ""
-            nil = f"Rp{rp(a['nilai'])}" if pd.notna(a["nilai"]) else ""
-            lines.append(" | ".join(x for x in [tgl_today, a["akun"], a["aksi"], a["kode"], f"{lot_txt} {hg}".strip(),
-                                                nil, f"TP {a['tp']}" if a["tp"] else "",
-                                                f"SL {a['sl']}" if a["sl"] else "", a["alasan"]] if x))
-    for _, r in pos_df[pos_df["asal"] == "deviasi"].iterrows():
-        lines.append(f"{tgl_today} | {r['akun']} | DEVIASI (dipegang) | {r['kode']} | {int(num(r['lot']))} lot "
-                     f"@{num(r['avg']):,.2f} | dipisahkan dari kinerja sistem")
-    st.text_area("Rencana transaksi hari ini", "\n".join(lines) or "-", height=180)
-
-# ----------------------------------------------------------------- STATE: unduh
-with tab_state:
-    st.download_button("⬇ Unduh state JSON (simpan di akhir sesi)", data=build_state_json(),
-                       file_name=f"state_gabungan_{now.strftime('%Y-%m-%d')}.json", mime="application/json")
-    if pos_eval:
-        st.caption("ob_streak dan ob_tgl posisi Compounding di file unduhan sudah diperbarui sampai candle "
-                   f"{stock_last.strftime('%d %b %Y')}.")
-        st.dataframe(pd.DataFrame([dict(kode=pos_df.at[i, "kode"], K=e["k"], ob_streak=e["ob"], ob_tgl=e["ob_tgl"],
-                                         sinyal=e["trig"][0] if e["trig"] else "HOLD")
-                                   for i, e in pos_eval.items()]),
-                     hide_index=True, width="stretch",
-                     column_config={"K": st.column_config.NumberColumn(format="%.1f")})
-
-# ----------------------------------------------------------------- HARMONIC
-with tab_hb:
-    if hb_df.empty:
-        st.info("Belum ada sinyal harmonic bullish skala Besar/Menengah yang lolos syarat.")
-    else:
-        vv = hb_df.copy()
-        vv["Min hari ke PRZ"] = [min_hari_ke_prz(h_, t_, arb) for h_, t_ in zip(vv["Harga"], vv["Antri Atas"])]
-        vv["Dipegang/antri"] = vv["Kode"].isin(dipegang).map({True: "ya", False: ""})
-        vv["_sk"] = (vv["Skala"] != "Besar").astype(int)
-        vv["_so"] = (vv["Status Order"] != "SAH").astype(int)
-        vv = vv.sort_values(["_sk", "_so", "Jarak PRZ %"]).drop(columns=["_sk", "_so"]).reset_index(drop=True)
-        st.markdown(cards([
-            ("SAH BESAR", int(((vv["Skala"] == "Besar") & (vv["Status Order"] == "SAH")).sum()), COL["cyan"],
-             "dibuatkan order"),
-            ("SAH MENENGAH", int(((vv["Skala"] == "Menengah") & (vv["Status Order"] == "SAH")).sum()), COL["violet"],
-             "kalau jatah 20% masih ada"),
-            ("TUA", int((vv["Status Order"] == "TUA").sum()), COL["amber"],
-             f"PRZ disentuh > {HB_SENTUH_MAX} hari bursa lalu"),
-            ("PRZ LEBAR", int((vv["PRZ lebar"] != "").sum()), COL["red"], f"risiko > {HB_LEBAR_X:g}× potensi"),
-        ]), unsafe_allow_html=True)
-        vv["_o"] = [0 if (so == "SAH" and dp != "ya") else (1 if dp == "ya" else 2)
-                    for so, dp in zip(vv["Status Order"], vv["Dipegang/antri"])]
-        vv = vv.sort_values(["_o"], kind="stable").drop(columns="_o").reset_index(drop=True)
-        SO_COL = {"SAH": COL["cyan"], "TUA": COL["amber"], "KEDALUWARSA": COL["dim"]}
-        for j, r in vv.iterrows():
-            held = r["Dipegang/antri"] == "ya"
-            lab = "DIPEGANG" if held else r["Status Order"]
-            c = COL["green"] if held else SO_COL.get(r["Status Order"], COL["red"])
-            sentuh = ("belum disentuh" if pd.isna(r["Sentuh PRZ (hari lalu)"])
-                      else f'disentuh {int(r["Sentuh PRZ (hari lalu)"])} hari lalu')
-            mh = r["Min hari ke PRZ"]
-            mh_txt = "sudah di/bawah PRZ" if mh == 0 else (f"min {mh} hari ke PRZ" if mh is not None else "")
-            lebar = f' · <b style="color:{COL["red"]}">PRZ LEBAR</b>' if r["PRZ lebar"] else ""
-            st.markdown(
-                f'<div class="mg-act" style="border-left:4px solid {c}">'
-                f'<div class="t"><span class="k">{r["Kode"]}</span>'
-                f'<span class="b" style="color:{c};border-color:{c}">{lab}</span></div>'
-                f'<div class="a">{r["Skala"]} · {r["Pola"]} · {r["Status"]}</div>'
-                f'<div class="r">Harga <b>{rp(r["Harga"])}</b> · jarak PRZ <b>{r["Jarak PRZ %"]:.1f}%</b> · {mh_txt}</div>'
-                f'<div class="r">Antri <b style="color:{COL["violet"]}">{rp(r["Antri Atas"])}</b> / '
-                f'<b style="color:{COL["violet"]}">{rp(r["Antri Bawah"])}</b> · TP1 '
-                f'<b style="color:{COL["green"]}">{rp(r["TP1"])}</b> · stop '
-                f'<b style="color:{COL["red"]}">{rp(r["Stop (close)"])}</b></div>'
-                f'<div class="r">Dari antri atas: risiko <b style="color:{COL["red"]}">{r["Risiko dari atas %"]:.0f}%</b>'
-                f' · potensi <b style="color:{COL["green"]}">+{r["Potensi TP1 dari atas %"]:.0f}%</b>{lebar}</div>'
-                f'<div class="n">PRZ {sentuh} · aktif sejak {r["Aktif sejak"]} · {r["Waktu"]}</div></div>',
-                unsafe_allow_html=True)
-            ck = f'{r["Kode"]}|{r["Skala"]}|{r["Pola"]}|{r["Tanggal C"]}'
-            if go is not None and st.button(f"Grafik {r['Kode']} ›", key=f"g_{ck}", width="stretch"):
-                ss["_chart"] = None if ss.get("_chart") == ck else ck
-            if ss.get("_chart") == ck:
-                dd = hb_frame(data_all.get(r["Kode"]))
-                p = find_pattern(dd, r["Skala"], r["Pola"], r["Tanggal C"]) if dd is not None else None
-                if p is not None:
-                    st.plotly_chart(make_chart(r["Kode"], dd, p, r["Skala"]), width="stretch",
-                                    config={"displaylogo": False, "scrollZoom": True}, key=f"ch_{ck}")
-                else:
-                    st.caption("Pola tidak ditemukan ulang (data berubah). Tekan Tarik ulang data.")
-        if go is None:
-            st.caption("Grafik butuh paket plotly (tambahkan ke requirements.txt).")
-        num0 = st.column_config.NumberColumn(format="%.0f")
-        num1 = st.column_config.NumberColumn(format="%.1f")
-        with st.expander("Lihat sebagai tabel"):
-          st.dataframe(
-            vv, hide_index=True, width="stretch", height=min(640, 38 + 35 * max(len(vv), 1)),
-            column_order=["Kode", "Skala", "Pola", "Status Order", "Dipegang/antri", "Status", "Kategori",
-                          "PRZ lebar", "Harga", "Jarak PRZ %", "Min hari ke PRZ", "Antri Atas", "Antri Bawah",
-                          "Stop (close)", "TP1", "Harga C", "Risiko dari atas %", "Potensi TP1 dari atas %",
-                          "R:R Rencana", "Sentuh PRZ (hari lalu)", "Aktif sejak", "Umur sinyal (hari)",
-                          "Waktu", "Tanggal C", "Umur C", "Value Min 20H (M)"],
-            column_config={"Harga": num0, "Antri Atas": num0, "Antri Bawah": num0, "Stop (close)": num0,
-                           "TP1": num0, "Harga C": num0, "Jarak PRZ %": num1, "Risiko dari atas %": num1,
-                           "Potensi TP1 dari atas %": num1,
-                           "R:R Rencana": st.column_config.NumberColumn(format="%.2f"),
-                           "Value Min 20H (M)": num1})
-        st.caption("SAH = pernah masuk jarak ≤15% sejak C, belum tembus C, umur ≤220 hari, PRZ belum disentuh "
-                   f"atau baru disentuh ≤{HB_SENTUH_MAX} hari bursa lalu. TUA = tetap tampil, tanpa order.")
-    if hb_gagal:
-        st.caption(f"{hb_gagal} perhitungan gagal dan dilewati.")
-
-# ----------------------------------------------------------------- COMPOUNDING
-with tab_ct:
-    if sesi == "SESI SORE":
-        st.markdown('<div class="mg-warn">Sesi sore: candle sudah final, pasar sudah tutup. Sinyal Compounding '
-                    'dieksekusi di sesi 15.00–16.15 (beli sebelum close). Daftar ini untuk cek saja.</div>',
-                    unsafe_allow_html=True)
-    if ctdf.empty:
-        st.info("Tidak ada kandidat breakout yang lolos gerbang Compounding.")
-    else:
-        st.markdown(cards([
-            ("LOLOS SCREENER", len(ctdf), COL["text"], "semua gerbang kode asli"),
-            ("ORDER BELI", len(ct_orders), COL["green"], f"20% modal = {rp(alok_ct)}"),
-            ("DICORET / DITAHAN", int((ctdf["Status"] != "BELI").sum()), COL["red"],
-             "red-flag, ARA, ambang BEAR, euforia"),
-            ("AMBANG CONF", f"{amb_baru}", COL["amber"], f"versi lama: {amb_lama}"),
-        ]), unsafe_allow_html=True)
-        for _, r in ctdf.iterrows():
-            beli = r["Status"] == "BELI"
-            c = COL["green"] if beli else COL["dim"]
-            conf = float(r["Buy Conf"])
-            cc = COL["green"] if conf >= 75 else (COL["amber"] if conf >= 50 else COL["red"])
-            st.markdown(
-                f'<div class="mg-act" style="border-left:4px solid {c}">'
-                f'<div class="t"><span class="k">{r["Kode"]}</span>'
-                f'<span class="b" style="color:{c};border-color:{c}">{"BELI" if beli else "DICORET"}</span></div>'
-                f'<div class="r">Conf <b style="color:{cc}">{conf:.0f}%</b> · close <b>{rp(r["Close"])}</b> '
-                f'({r["Naik hari ini %"]:+.1f}%) · CL <b style="color:{COL["red"]}">{rp(r["CL (LL20)"])}</b></div>'
-                f'<div class="mg-bar"><div style="width:{conf:.0f}%;background:{cc}"></div></div>'
-                f'<div class="n">K {r["K"]:.0f} · fase {r["Fase"]} · vol ratio {r["Vol Ratio"]:.2f}'
-                + ("" if beli else f' · {r["Status"]}') + '</div></div>', unsafe_allow_html=True)
-        with st.expander("Lihat sebagai tabel"):
-          st.dataframe(ctdf, hide_index=True, width="stretch", height=min(640, 38 + 35 * max(len(ctdf), 1)),
-                     column_config={"Buy Conf": st.column_config.NumberColumn(format="%.0f"),
-                                    "Close": st.column_config.NumberColumn(format="%.0f"),
-                                    "CL (LL20)": st.column_config.NumberColumn(format="%.0f"),
-                                    "HH20": st.column_config.NumberColumn(format="%.0f"),
-                                    "Naik hari ini %": st.column_config.NumberColumn(format="%.1f"),
-                                    "K": st.column_config.NumberColumn(format="%.1f"),
-                                    "Vol Ratio": st.column_config.NumberColumn(format="%.2f"),
-                                    "Value MA20 (M)": st.column_config.NumberColumn(format="%.1f")})
-        for kode, why in ct_info:
-            st.caption(f"{kode}: {why}")
+            if f"{
